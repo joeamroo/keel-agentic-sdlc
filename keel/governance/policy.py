@@ -196,8 +196,21 @@ class SecretScanRule:
         violations: list[PolicyViolation] = []
         seen: set[tuple[str, str]] = set()
         for artifact in artifacts:
+            # A test file needs fake credentials to test credential handling.
+            # The generic heuristics (the entropy-gated `secret=` and `api_key=`
+            # shapes) therefore do not apply to one, while every
+            # provider-specific pattern still does: an invented `s3cret-abc` in
+            # a rate-limiting test is a fixture, and a real sk-ant- key in the
+            # same file is still a leak.
+            #
+            # A live run burned three attempts and most of a budget when a
+            # generated suite for API-key rate limiting was denied at CRITICAL
+            # for containing a fake API key.
+            in_test = _is_test_artifact(artifact)
             for line_no, line in enumerate(artifact.content.splitlines(), start=1):
                 for spec in _SECRET_PATTERNS:
+                    if in_test and spec.min_entropy > 0:
+                        continue
                     for match in spec.pattern.finditer(line):
                         value = match.group(spec.value_group)
                         if _looks_like_placeholder(value, line):

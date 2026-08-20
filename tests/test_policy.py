@@ -816,3 +816,57 @@ def test_schema_destruction_in_application_code_is_still_critical() -> None:
     violations = DestructiveOperationRule().evaluate([artifact], node("implement"))
     assert violations, "application code dropping a table was not flagged"
     assert violations[0].severity is Severity.CRITICAL
+
+
+# --------------------------------------------------------------------------
+# Test files need fake credentials; they must not become a blind spot
+# --------------------------------------------------------------------------
+
+def _test_file(content: str) -> Artifact:
+    a = art(content, name="tests/test_keys.py", produced_by="author-tests")
+    a.path = "tests/test_keys.py"
+    return a
+
+
+def _app_file(content: str) -> Artifact:
+    a = art(content, name="app/config.py", produced_by="implement")
+    a.path = "app/config.py"
+    return a
+
+
+def test_invented_fixture_credentials_in_a_test_are_not_flagged() -> None:
+    """Regression: a suite for API-key rate limiting was denied for having API keys.
+
+    A live run burned three attempts and most of a budget on this. The generated
+    tests contained a fake key because the feature under test is keys.
+    """
+    for content in (
+        'SHORTENER_API_KEYS = "alpha:100,beta:20"',
+        'secret = "s3cret-abc123"',
+        'api_key = "test-key-for-the-fixture"',
+    ):
+        assert SecretScanRule().evaluate([_test_file(content)], node()) == [], content
+
+
+def test_a_real_provider_key_in_a_test_file_is_still_critical() -> None:
+    """The scoping must not turn test files into a place to hide a live key.
+
+    The first version of this fix compared `min_entropy` against None. It
+    defaults to 0.0, so the comparison was true for every pattern and secret
+    scanning was silently disabled inside test files entirely.
+    """
+    anthropic = 'K = "' + "sk-ant" + "-api03-" + "aB3xQ7mZ9kL2pR5vT8wY1nC4hJ6sD0fG" * 3 + '"'
+    aws = 'K = "' + "AKIA" + '2R7KQ4VN8PLDT3WZ"'
+    github = 'K = "' + "ghp" + '_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"'
+
+    for content in (anthropic, aws, github):
+        violations = SecretScanRule().evaluate([_test_file(content)], node())
+        assert violations, f"a real provider key hid inside a test file: {content[:30]}"
+        assert violations[0].severity is Severity.CRITICAL
+
+
+def test_the_same_weak_secret_in_application_code_is_still_flagged() -> None:
+    """Only test files get the exemption, and only for the generic heuristics."""
+    violations = SecretScanRule().evaluate([_app_file('secret = "s3cret-abc123"')], node())
+    assert violations
+    assert violations[0].severity is Severity.CRITICAL
