@@ -105,6 +105,24 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
 }
 
 
+def price_for(model: str) -> tuple[float, float]:
+    """Rates for a model id, tolerating a dated suffix.
+
+    The API echoes back the resolved id, which for some models carries a date
+    (`claude-haiku-4-5-20251001`) that an alias-keyed table does not contain.
+    An exact lookup therefore priced those calls at zero and silently
+    understated the cost metric, which was caught by a live run reporting a
+    Haiku stage as free. Returning zero for a genuinely unknown model is still
+    the right default, but a known model wearing its date is not unknown.
+    """
+    if model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    for known, rates in MODEL_PRICING.items():
+        if model.startswith(known):
+            return rates
+    return (0.0, 0.0)
+
+
 class ScenarioKind(str, Enum):
     GREENFIELD = "greenfield"
     BROWNFIELD = "brownfield"
@@ -483,7 +501,7 @@ class AdapterResponse:
 
     @property
     def cost_usd(self) -> float:
-        rate_in, rate_out = MODEL_PRICING.get(self.model, (0.0, 0.0))
+        rate_in, rate_out = price_for(self.model)
         return (self.input_tokens * rate_in + self.output_tokens * rate_out) / 1_000_000
 
 

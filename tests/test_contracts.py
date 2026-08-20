@@ -134,3 +134,23 @@ def test_planner_only_emits_skills_that_a_stage_definition_serves(tmp_path):
             assert node.skill_id in known, (
                 f"node {node.id} routes to skill {node.skill_id!r}, which no stage serves"
             )
+
+
+def test_a_dated_model_id_is_still_priced():
+    """Regression: the API echoes a dated id that an alias-keyed table misses.
+
+    A live run reported a Haiku stage as costing nothing, because the response
+    named `claude-haiku-4-5-20251001` while the pricing table is keyed on the
+    alias. Silently pricing a real call at zero understates the cost metric,
+    which is one of the reliability numbers the system reports.
+    """
+    from keel.models import AdapterResponse, price_for
+
+    assert price_for("claude-haiku-4-5-20251001") == price_for("claude-haiku-4-5")
+    assert price_for("claude-opus-5") == (5.00, 25.00)
+    assert price_for("some-model-we-have-never-heard-of") == (0.0, 0.0)
+
+    dated = AdapterResponse(
+        text="x", model="claude-haiku-4-5-20251001", input_tokens=1_000_000, output_tokens=0
+    )
+    assert dated.cost_usd == 1.00, "a dated model id was priced at zero"
