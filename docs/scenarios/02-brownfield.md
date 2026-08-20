@@ -49,6 +49,15 @@ The same gates as greenfield, plus `ChangeControlRule`, which flags a high-impac
 
 Look for `approval_requested`, `approval_decided` and `plan_revised` in `runs/<run_id>/audit.jsonl`. The report renders the approval log and both plan versions.
 
+## What the committed recording contains
+
+The recording stops after implementation, because the API credit funding it ran
+out mid-run. Everything unique to this scenario is in there: impact analysis
+over the existing service, the plan taking its brownfield shape, the approval
+request and decision, and an implementation that really modified the generated
+code rather than rewriting it. Test authoring, verification, review and the
+release check are absent. Re-record with `--mode live`.
+
 ## Honest limit
 
 Re-planning triggers on one class of evidence: a missing extension point found during impact analysis. The mechanism is general, and the lineage store already detects hash-level staleness that the planner does not yet act on. Broadening the trigger set is the obvious next step.

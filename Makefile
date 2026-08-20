@@ -22,9 +22,12 @@ demo-live:
 	$(VENV) -m keel.cli run --scenario greenfield --mode live
 
 scenarios:
-	$(VENV) -m keel.cli run --scenario greenfield  --replay-from demo-greenfield
-	$(VENV) -m keel.cli run --scenario ambiguous   --replay-from demo-ambiguous
-	$(VENV) -m keel.cli run --scenario brownfield  --replay-from demo-brownfield
+	$(VENV) -m keel.cli run --scenario greenfield --replay-from demo-greenfield
+	$(VENV) -m keel.cli run --scenario ambiguous  --replay-from demo-ambiguous
+	$(VENV) -m keel.cli run --scenario ambiguous  --replay-from demo-ambiguous-resumed --answer-ambiguities
+	@echo
+	@echo "brownfield is recorded only as far as implementation; re-record with --mode live"
+
 
 test:
 	$(VENV) -m pytest -q

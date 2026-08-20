@@ -61,6 +61,25 @@ If the suite fails, the run does not stop there. It discards the implementation,
 keel run --scenario ambiguous --answer-ambiguities
 ```
 
+## What is recorded, and what is not
+
+Being precise about this, because the difference matters to anyone evaluating the repo.
+
+| Scenario | Recorded | Replays offline |
+| --- | --- | --- |
+| greenfield | all seven nodes, verification passed | yes, end to end |
+| ambiguous (park) | intake refusing to plan | yes |
+| ambiguous (resumed) | all seven nodes after the questions were answered | yes, end to end |
+| brownfield | impact analysis, design, human approval, implementation | partially |
+
+The brownfield recording stops after implementation because my API credit ran
+out mid-run. What it does contain is the part unique to that scenario:
+reasoning over the existing service, the change-control approval firing before
+anything was written, and an implementation that genuinely modified the
+generated code (it added `app/apikeys.py` and changed `config.py`, `db.py`,
+`main.py`, `errors.py` and `ratelimit.py`). Test authoring onward is missing.
+Re-record it with `--mode live` and a funded key.
+
 ## What each run leaves behind
 
 ```
@@ -70,6 +89,12 @@ runs/<run_id>/
   report.html     self-contained, opens offline, no network requests
   summary.json    what was asked, what was decided, what it cost
 ```
+
+A replayed response is matched first by an exact hash of its prompt, which
+proves it was produced for that input. Editing a stage prompt invalidates those
+hashes, so a miss falls back to the next unused recording for the same node and
+says so in the output. It never silently serves a recording made for a
+different prompt.
 
 `audit.jsonl` is append-only, credential-redacted, and integrity-checkable. It is also the replay cassette store, so observability and reproducibility are the same artifact rather than two systems that can disagree.
 
