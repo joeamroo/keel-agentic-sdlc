@@ -237,6 +237,7 @@ _DESIGN_SCHEMA: dict[str, Any] = {
         "overview",
         "endpoints",
         "data_model",
+        "configuration",
         "decisions",
         "redirect_status_code",
         "short_code_strategy",
@@ -246,6 +247,31 @@ _DESIGN_SCHEMA: dict[str, Any] = {
         "overview": {
             "type": "string",
             "description": "Two or three sentences on the shape of the service.",
+        },
+        "configuration": {
+            "type": "array",
+            "description": (
+                "Every environment variable the service reads, with its exact "
+                "name and default. Implementation and test authoring run "
+                "concurrently and both bind to this list, so a name invented "
+                "downstream instead of taken from here will not match."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "default", "purpose"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact variable name, for example DATABASE_PATH.",
+                    },
+                    "default": {
+                        "type": "string",
+                        "description": "Value used when the variable is unset.",
+                    },
+                    "purpose": {"type": "string", "description": "What it controls."},
+                },
+            },
         },
         "endpoints": {
             "type": "array",
@@ -715,6 +741,14 @@ returns and whether that response distinguishes expired from never existed, \
 where the click analytics write happens relative to the redirect response, and \
 at which layer rate limiting is enforced and what it is keyed by.
 
+configuration is a contract, not documentation. Implementation and test \
+authoring run at the same time from this design and never see each other's \
+output, so anything both of them touch has to be pinned here or they will each \
+invent a reasonable name and disagree. List every environment variable with its \
+exact name and default. This has already gone wrong once: the service read \
+DATABASE_PATH while the tests set LINKS_DB_PATH, both sensible, and every test \
+that checked persistence failed.
+
 Return one JSON object matching the schema. No prose outside it.\
 """
 
@@ -777,6 +811,12 @@ deployment boundary.
 
 Paths are relative to the workspace root with POSIX separators.
 
+Bind to the design's configuration list exactly. Use the environment \
+variable names and defaults it gives you and do not invent your own, even when \
+a different name reads better. Implementation and test authoring run \
+concurrently and never see each other's output, so the design is the only place \
+the two can agree.
+
 Return one JSON object matching the schema. No prose outside it.\
 """
 
@@ -822,6 +862,12 @@ Determinism is a requirement, not a preference. No network, no sleeps, no \
 dependence on test ordering, no shared database between tests. A flaky \
 security test gets deleted by the next engineer who sees it go red, which \
 means a flaky test is a deleted test.
+
+Bind to the design's configuration list exactly. Use the environment \
+variable names and defaults it gives you and do not invent your own, even when \
+a different name reads better. Implementation and test authoring run \
+concurrently and never see each other's output, so the design is the only place \
+the two can agree.
 
 Return one JSON object matching the schema. No prose outside it.\
 """

@@ -163,6 +163,13 @@ class Planner:
                 depends_on=[IMPLEMENT, AUTHOR_TESTS],
                 skill_id=StageKind.TEST.value,
                 model_tier=ModelTier.FAST,
+                # No retries. This node shells out to pytest against code that
+                # nothing changed between attempts, so every attempt returns
+                # the same exit code by construction. A live run burned three
+                # attempts on an identical deterministic failure. Retry earns
+                # its keep against flaky or nondeterministic work; repeating a
+                # pure function is just latency.
+                retry=RetryPolicy(max_attempts=0),
                 entry_rules=["code_and_tests_present"],
                 exit_rules=["tests_executed", "tests_passed"],
                 produces=["verify.json"],

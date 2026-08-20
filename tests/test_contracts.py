@@ -154,3 +154,54 @@ def test_a_dated_model_id_is_still_priced():
         text="x", model="claude-haiku-4-5-20251001", input_tokens=1_000_000, output_tokens=0
     )
     assert dated.cost_usd == 1.00, "a dated model id was priced at zero"
+
+
+def test_the_design_pins_the_configuration_surface():
+    """Regression: parallel stages diverged on an unspecified env var name.
+
+    A live run produced a service reading DATABASE_PATH and a test suite setting
+    LINKS_DB_PATH. Both names are reasonable; neither stage was wrong. They ran
+    concurrently from the same design and never saw each other's output, so
+    anything they both bind to has to be fixed by their shared upstream.
+    """
+    from keel.agents.definitions import DEFINITIONS
+    from keel.models import StageKind
+
+    design = DEFINITIONS[StageKind.DESIGN].json_schema
+    assert "configuration" in design["required"], (
+        "the design does not have to declare the configuration surface, so the "
+        "parallel stages can still each invent their own variable names"
+    )
+    item = design["properties"]["configuration"]["items"]
+    assert set(item["required"]) >= {"name", "default"}
+
+
+def test_both_parallel_stages_are_told_to_bind_to_the_design():
+    """A schema field nobody is told to honour is documentation, not a contract."""
+    from keel.agents.definitions import DEFINITIONS
+    from keel.models import StageKind
+
+    for kind in (StageKind.IMPLEMENT, StageKind.TEST):
+        prompt = DEFINITIONS[kind].system_prompt.lower()
+        assert "configuration" in prompt and "design" in prompt, (
+            f"{kind.value} is never told to take its configuration from the design"
+        )
+
+
+def test_verify_does_not_retry_a_deterministic_check():
+    """Regression: a live run burned three attempts on an identical failure.
+
+    The verification node shells out to pytest against code that nothing
+    changes between attempts, so every attempt returns the same exit code by
+    construction. Retry is for flaky work, not for repeating a pure function.
+    """
+    from keel.models import EngineeringProblem, ScenarioKind
+    from keel.planner import IMPLEMENT, VERIFY, Planner
+
+    plan = Planner().build(
+        EngineeringProblem(raw_requirement="x", scenario=ScenarioKind.GREENFIELD, confidence=0.9)
+    )
+
+    assert plan.by_id(VERIFY).retry.max_attempts == 0
+    # The generative stages keep their budget; only the deterministic one loses it.
+    assert plan.by_id(IMPLEMENT).retry.max_attempts > 0
