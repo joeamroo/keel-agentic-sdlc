@@ -500,6 +500,14 @@ class Executor:
             {"approved": decision.approved, "by": decision.decided_by, "note": decision.note},
             node_id=node.id,
         )
+
+        # The gate has to learn what the human decided, or change control
+        # denies the very node it just authorised.
+        if decision.approved:
+            record = getattr(self.policy, "record_approval", None)
+            if callable(record):
+                record(node.id)
+
         return decision.approved
 
     def _repair(

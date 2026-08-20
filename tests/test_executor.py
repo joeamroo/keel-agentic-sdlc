@@ -565,3 +565,84 @@ def test_a_failure_that_is_not_verification_does_not_trigger_a_repair(tmp_path):
     assert result.state is TaskState.FAILED
     assert result.repairs == 0
     assert not any(e.event_type is AuditEventType.REPAIR_STARTED for e in audit.events())
+
+
+def test_an_approved_node_passes_its_own_change_control_gate(tmp_path):
+    """Regression: approval was granted and then the gate denied the same node.
+
+    The change-control rule holds an approval set fixed at construction, and the
+    CLI built it empty. Nothing connected the approval broker to it, so every
+    high-impact node was authorised by a human and then failed its exit gate for
+    lacking authorisation. A live brownfield run recorded approved=true and a
+    blocking change_control violation on the same node within seconds.
+
+    The whole suite passed while that was true, which is why this test exists.
+    """
+    from keel.governance.policy import ChangeControlRule, PolicyEngine
+
+    spec = node(
+        "implement",
+        impact=ImpactLevel.HIGH,
+        retry=RetryPolicy(max_attempts=0, backoff_seconds=0.0),
+    )
+    plan = Plan(nodes=[spec])
+    outcome = StageOutcome(
+        state=TaskState.COMPLETED,
+        artifacts=[
+            Artifact(name="app.py", content="x = 1\n", produced_by="implement", path="app.py")
+        ],
+        parsed={},
+    )
+    # Constructed empty, exactly as the CLI does.
+    engine = PolicyEngine([ChangeControlRule(approved_nodes=set())])
+    ex, _, audit, ws = build(
+        tmp_path,
+        plan,
+        {"implement": [outcome]},
+        approvals=ScriptedApprovalBroker({"implement": True}),
+        policy=engine,
+    )
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.COMPLETED, (
+        f"an approved node was blocked by change control: {result.stopped_reason}"
+    )
+    assert "app.py" in ws.list_files()
+    violations = [
+        e for e in audit.events()
+        if e.event_type is AuditEventType.POLICY_VIOLATION
+        and e.payload.get("rule") == "change_control.approval_required"
+    ]
+    assert not violations, "change control fired on a node the human had approved"
+
+
+def test_change_control_still_blocks_a_node_nobody_approved(tmp_path):
+    """The other half: recording approvals must not disarm the rule."""
+    from keel.governance.policy import ChangeControlRule, PolicyEngine
+
+    spec = node(
+        "implement",
+        impact=ImpactLevel.HIGH,
+        retry=RetryPolicy(max_attempts=0, backoff_seconds=0.0),
+    )
+    plan = Plan(nodes=[spec])
+    outcome = StageOutcome(
+        state=TaskState.COMPLETED,
+        artifacts=[
+            Artifact(name="app.py", content="x = 1\n", produced_by="implement", path="app.py")
+        ],
+        parsed={},
+    )
+    ex, _, _, ws = build(
+        tmp_path,
+        plan,
+        {"implement": [outcome]},
+        approvals=ScriptedApprovalBroker({"implement": False}),
+        policy=PolicyEngine([ChangeControlRule(approved_nodes=set())]),
+    )
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.results["implement"].state is TaskState.REJECTED
+    assert ws.list_files() == []

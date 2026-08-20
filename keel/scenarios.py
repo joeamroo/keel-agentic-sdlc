@@ -68,10 +68,31 @@ GREENFIELD = Scenario(
 BROWNFIELD = Scenario(
     key="brownfield",
     title="Add rate limiting to the existing shortener",
+    # Specified against the system it modifies, which the first draft was not.
+    # It asked for per-API-key limiting on a service the greenfield requirement
+    # had deliberately made unauthenticated, and the analyst correctly refused
+    # to plan it: there was nowhere for a key to come from. Naming the key
+    # source and the fallback is what makes the change coherent.
     requirement=(
-        "Add per-API-key rate limiting to the existing URL shortener. Callers "
-        "exceeding their quota must receive HTTP 429 with a Retry-After header. "
-        "Existing clients must keep working unchanged."
+        "Add per-API-key rate limiting to the existing URL shortener.\n\n"
+        # The example deliberately avoids a quoted assignment. An earlier
+        # wording spelled it as NAME="alpha:100,beta:20", which the secret
+        # scanner reads as a hardcoded credential and blocked, costing a full
+        # Opus retry on the design stage. Illustrating the format without the
+        # assignment shape is the cheaper honest fix.
+        "Keys come from the environment, not from the database. The variable "
+        "SHORTENER_API_KEYS holds a comma-separated list of key:quota pairs, so "
+        "a key named alpha with a quota of 100 and a key named beta with a "
+        "quota of 20 are written as two such pairs. The quota is requests per "
+        "minute for link creation. There is no admin surface and no schema "
+        "change; an unknown key is treated as no key.\n\n"
+        "A caller presents its key in an X-API-Key header. A request carrying a "
+        "known key is limited against that key's quota. A request with no key, "
+        "or an unknown one, keeps the existing per-IP limit exactly as it "
+        "behaves today, so existing clients continue to work unchanged.\n\n"
+        "A caller over its quota receives HTTP 429 with a Retry-After header "
+        "giving whole seconds until the window resets. Redirects are not rate "
+        "limited; only link creation is."
     ),
     expects=ScenarioKind.BROWNFIELD,
     demonstrates=[
@@ -94,15 +115,37 @@ AMBIGUOUS = Scenario(
         "writing zero code until a human answers",
         "resuming from the park rather than starting over",
     ],
+    # A human answering the questions, not a lookup table keyed to them.
+    #
+    # The first version of this matched answers to question text, which only
+    # worked until the analyst phrased a question differently. It re-derives
+    # the questions on every run, so an answer keyed to last run's wording
+    # resolves nothing and the resume parks again. What a person actually does
+    # is answer the substance, so the clarification covers the decision space
+    # rather than the exact sentences.
     answers={
-        "What does secure mean here": (
-            "Block the service being used for phishing: reject javascript:, data: "
-            "and file: schemes, and reject targets resolving to private or "
-            "link-local addresses."
+        "What kind of links are these": (
+            "Short redirect links. This is a URL shortener, not magic-link "
+            "authentication and not document sharing."
         ),
-        "Should links require authentication": "No. Creation stays open for now.",
-        "Do links need to expire": "Yes, default 30 days, caller may override.",
-        "Is scanning destinations for malware in scope": "No, out of scope.",
+        "Who may use a link": (
+            "Anyone holding it. The link is a bearer capability, with no "
+            "per-recipient identity check at resolution."
+        ),
+        "Do already-issued links have to keep working": (
+            "No. There is no predecessor system; this is the service being built."
+        ),
+        "What does secure mean here": (
+            "Stop the service being usable for phishing. Reject javascript:, "
+            "data: and file: schemes, and reject any destination resolving to a "
+            "loopback, private or link-local address, including the cloud "
+            "metadata endpoint. Never fetch the destination."
+        ),
+        "Should creating a link require authentication": (
+            "No. Creation stays open, with per-IP rate limiting for abuse."
+        ),
+        "Do links expire": "Yes. Default 30 days, and the caller may override.",
+        "Is scanning destinations against a threat feed in scope": "No.",
     },
 )
 

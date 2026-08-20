@@ -766,6 +766,23 @@ class PolicyEngine:
 
     # -- rule set ---------------------------------------------------------
 
+    def record_approval(self, node_id: str) -> None:
+        """Tell the rules a human approved this node.
+
+        Without this the change-control rule holds whatever approval set it was
+        constructed with, which in a live run is empty, so an approved node
+        fails its own exit gate for not being approved. A live brownfield run
+        did exactly that: the broker recorded approved=true and the gate denied
+        the same node moments later.
+
+        Forwarding by capability rather than by type keeps the engine from
+        knowing which rules care.
+        """
+        for rule in self._rules:
+            approve = getattr(rule, "approve", None)
+            if callable(approve):
+                approve(node_id)
+
     def register(self, rule: PolicyRule) -> PolicyEngine:
         """Add a rule. Returns self so a rule set can be built in one expression."""
         if not isinstance(rule, PolicyRule):
