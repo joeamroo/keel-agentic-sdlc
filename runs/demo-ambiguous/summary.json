@@ -1,0 +1,48 @@
+{
+  "run_id": "demo-ambiguous",
+  "scenario": "ambiguous",
+  "requirement": "Make the links more secure.",
+  "demonstrates": [
+    "detecting that a requirement cannot be planned",
+    "parking in the A2A input_required state instead of guessing",
+    "writing zero code until a human answers",
+    "resuming from the park rather than starting over"
+  ],
+  "intake": {
+    "state": "input_required",
+    "confidence": 0.34,
+    "scenario_detected": "greenfield",
+    "ambiguities": [
+      {
+        "question": "What are these links \u2014 short/redirect links, one-time authentication or password-reset links, or access links to private files or documents?",
+        "why": "Each builds a different system: a redirect service needs open-redirect and SSRF controls; a magic-link auth flow needs single-use consumption, short TTL and session establishment; a document share link needs per-object authorization, optional passwords and download auditing. The data model, endpoints and threat model do not overlap enough to build one and adapt it.",
+        "blocking": true
+      },
+      {
+        "question": "Should a link be usable by anyone who possesses it (capability URL), or must the recipient additionally authenticate and be matched to the link's intended identity?",
+        "why": "Bearer-capability links need only entropy, TTL and revocation. Identity-bound links require an authentication gate, an owner/recipient column, an authorization check at resolution, and a different failure mode (403 vs 410) \u2014 a contract difference that cannot be retrofitted without breaking issued links.",
+        "blocking": true
+      },
+      {
+        "question": "Are links that have already been issued by an existing (unsupplied) system required to keep working after the hardening?",
+        "why": "The phrase 'more secure' implies a predecessor, but no code was supplied. If legacy tokens must resolve, the system needs a dual-path lookup and a migration/expiry window for weak tokens; if not, a single strong-token path ships and all old links break.",
+        "blocking": true
+      },
+      {
+        "question": "What default lifetime should a link have when the creator does not specify one?",
+        "why": "Sets the default value of expires_at and the copy shown to users; cheap to change later via configuration.",
+        "blocking": false
+      },
+      {
+        "question": "Should a link be single-use (consumed on first successful resolution) or reusable until expiry?",
+        "why": "Adds a used_at column and a consumption transaction; defaults differ by link type but the storage change is small and additive.",
+        "blocking": false
+      },
+      {
+        "question": "Should link resolution events be recorded for audit (who, when, from where)?",
+        "why": "Determines whether an access-log table and retention policy exist; additive and does not alter the resolution contract.",
+        "blocking": false
+      }
+    ]
+  }
+}

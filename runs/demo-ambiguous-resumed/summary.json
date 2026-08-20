@@ -1,0 +1,127 @@
+{
+  "run_id": "demo-ambiguous-resumed",
+  "scenario": "ambiguous",
+  "requirement": "Make the links more secure.",
+  "demonstrates": [
+    "detecting that a requirement cannot be planned",
+    "parking in the A2A input_required state instead of guessing",
+    "writing zero code until a human answers",
+    "resuming from the park rather than starting over"
+  ],
+  "intake": {
+    "state": "completed",
+    "confidence": 0.85,
+    "scenario_detected": "greenfield",
+    "ambiguities": [
+      {
+        "question": "Is there an upper bound on the caller-supplied expiry, and what is it?",
+        "why": "Determines whether the validator rejects expires_in_days above a cap (and returns 400) or accepts arbitrarily long or non-expiring links, which changes the storage retention model.",
+        "blocking": false
+      },
+      {
+        "question": "Does the creator get a way to revoke or delete a link before it expires?",
+        "why": "If yes, creation must return a one-time management secret and a DELETE endpoint must exist; if no, the only lifecycle control is expiry and the create response shape is smaller.",
+        "blocking": false
+      },
+      {
+        "question": "Should the redirect use 302 or 301/307/308?",
+        "why": "A 301 is cached by browsers and would keep working after expiry or revocation; 302 keeps every resolution under service control.",
+        "blocking": false
+      },
+      {
+        "question": "What are the concrete rate-limit numbers and window for anonymous creation?",
+        "why": "Fixes the threshold at which POST /links starts returning 429 and therefore the exact test values; too low blocks legitimate use, too high leaves abuse open.",
+        "blocking": false
+      },
+      {
+        "question": "Should a destination that points back at the shortener's own host (or another known shortener) be rejected to prevent redirect chains and loops?",
+        "why": "Determines whether a self-referential short URL is accepted at creation or returns 400, and whether loop detection is needed at resolution.",
+        "blocking": false
+      },
+      {
+        "question": "Is deduplication expected \u2014 does submitting the same destination twice return the same code?",
+        "why": "Changes whether the datastore has a unique index on destination and whether creation is idempotent; also affects whether two callers can observe each other's activity through a shared code.",
+        "blocking": false
+      },
+      {
+        "question": "What resolution-analytics, if any, must be recorded for each redirect?",
+        "why": "Determines whether the redirect path writes a hit row or increments a counter, and whether client IPs are retained (a privacy decision).",
+        "blocking": false
+      }
+    ]
+  },
+  "run": {
+    "state": "completed",
+    "stopped_reason": "",
+    "plan_version": 1,
+    "plan_revisions": 0,
+    "nodes": {
+      "design": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 119.821
+      },
+      "implement": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 595.776
+      },
+      "author-tests": {
+        "state": "completed",
+        "attempts": 2,
+        "rolled_back": true,
+        "used_fallback": false,
+        "duration": 908.264
+      },
+      "document": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 22.642
+      },
+      "verify": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 8.052
+      },
+      "review": {
+        "state": "completed",
+        "attempts": 2,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 850.731
+      },
+      "release-check": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 15.33
+      }
+    }
+  },
+  "metrics": {
+    "run_id": "demo-ambiguous-resumed",
+    "total_nodes": 7,
+    "succeeded": 7,
+    "failed": 0,
+    "retries": 2,
+    "rollbacks": 1,
+    "fallbacks": 0,
+    "approvals_requested": 0,
+    "plan_revisions": 0,
+    "e2e_latency_seconds": 1902.225124835968,
+    "mttr_seconds": 440.9117783308029,
+    "cost_usd": 6.013959,
+    "input_tokens": 156570,
+    "output_tokens": 218917,
+    "success_rate": 1.0
+  }
+}

@@ -1,0 +1,126 @@
+{
+  "run_id": "demo-greenfield",
+  "scenario": "greenfield",
+  "requirement": "Build a URL shortener service as a JSON HTTP API using FastAPI and SQLite.\n\nEndpoints: POST /api/links creates a short link from a long URL and returns the short code. GET /{code} redirects a visitor to the original URL. GET /api/links/{code}/stats returns click analytics for that link. GET /health returns service health.\n\nAccess: link creation is unauthenticated for this release. There is no user or API-key subsystem and analytics are public. Abuse is handled by per-IP rate limiting on creation, not by authentication.\n\nOpen redirect protection is a denylist, not an allowlist. Any public http or https destination is permitted. Reject any other scheme, and reject any destination resolving to a loopback, private or link-local address, including the cloud metadata address. The service must never fetch the destination itself.\n\nExpiry: a caller may pass an expiry; when omitted the link expires 30 days after creation. Requests for an expired link return 410 Gone.\n\nAnalytics: total click count plus timestamp, referrer and user agent per click. Do not store visitor IP addresses.\n\nShort codes are randomly generated, not sequential, so that links cannot be enumerated.",
+  "demonstrates": [
+    "decomposition of a clear requirement into a dependency graph",
+    "parallel execution of implementation, test authoring and documentation",
+    "a real pytest run as the verification gate, not a claimed one"
+  ],
+  "intake": {
+    "state": "completed",
+    "confidence": 0.85,
+    "scenario_detected": "greenfield",
+    "ambiguities": [
+      {
+        "question": "When the service runs behind a reverse proxy or CDN, should the rate limiter derive the client IP from X-Forwarded-For, or only from the direct socket peer address?",
+        "why": "Trusting X-Forwarded-For unconditionally lets any caller bypass the rate limit with a spoofed header; using only the socket address collapses every proxied request onto one bucket and rate-limits the whole internet as a single client.",
+        "blocking": false
+      },
+      {
+        "question": "What are the exact rate limit numbers (requests per window per IP)?",
+        "why": "Determines the threshold constant and the values used in the 429 acceptance test, but not the design of the limiter.",
+        "blocking": false
+      },
+      {
+        "question": "Should submitting the same long URL twice return the existing code or mint a new one?",
+        "why": "Deduplication changes the create path (lookup-before-insert) and the uniqueness guarantees callers can rely on.",
+        "blocking": false
+      },
+      {
+        "question": "Is 307 the required redirect status, or should 301/302 be used?",
+        "why": "301 is cached by browsers and would silently stop click analytics and expiry enforcement; 302 vs 307 differs only in method-preservation semantics.",
+        "blocking": false
+      },
+      {
+        "question": "Should DNS-based destination validation be repeated at redirect time, or performed only at creation time?",
+        "why": "Creation-time-only validation leaves a DNS rebinding window where a host that resolved publicly later points at an internal address; re-validating on every redirect adds a resolver call to the hot path.",
+        "blocking": false
+      },
+      {
+        "question": "Is there a maximum allowed caller-supplied expiry (e.g. one year), or may a caller request an arbitrarily distant expiry?",
+        "why": "A cap adds a validation branch and a 400 case; without one, links are effectively permanent and storage grows unbounded.",
+        "blocking": false
+      },
+      {
+        "question": "Should expired links and their click rows be purged, or retained indefinitely for analytics?",
+        "why": "Purging requires a background job and makes stats for expired links eventually 404 instead of 200.",
+        "blocking": false
+      }
+    ]
+  },
+  "run": {
+    "state": "completed",
+    "stopped_reason": "",
+    "plan_version": 1,
+    "plan_revisions": 0,
+    "nodes": {
+      "design": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 147.114
+      },
+      "implement": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 517.745
+      },
+      "author-tests": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 495.616
+      },
+      "document": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 22.767
+      },
+      "verify": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 3.662
+      },
+      "review": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 322.714
+      },
+      "release-check": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 19.702
+      }
+    }
+  },
+  "metrics": {
+    "run_id": "demo-greenfield",
+    "total_nodes": 7,
+    "succeeded": 7,
+    "failed": 0,
+    "retries": 0,
+    "rollbacks": 0,
+    "fallbacks": 0,
+    "approvals_requested": 0,
+    "plan_revisions": 0,
+    "e2e_latency_seconds": 1010.9408619403839,
+    "mttr_seconds": null,
+    "cost_usd": 3.694067,
+    "input_tokens": 101858,
+    "output_tokens": 136869,
+    "success_rate": 1.0
+  }
+}
