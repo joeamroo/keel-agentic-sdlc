@@ -468,12 +468,21 @@ def _render(
     rendering dependency here would drag a UI concern into the governance
     plane.
     """
-    columns = list(zip(*([headers, *rows] if rows else [headers])))
+    # Rows are padded to the header width before transposing. A bare
+    # `zip(*rows)` truncates to the shortest row, so a single short row would
+    # silently drop a column from the entire table, which is a bad failure for
+    # something whose job is to report numbers accurately.
+    width = len(headers)
+    grid = [list(headers)] + [list(r)[:width] + [""] * (width - len(list(r)[:width])) for r in rows]
+
+    columns = list(zip(*grid, strict=True))
     widths = [max(len(str(cell)) for cell in column) for column in columns]
     rule = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
 
     def line(cells: Sequence[str]) -> str:
-        padded = [f" {str(c):<{w}} " for c, w in zip(cells, widths)]
+        cells = list(cells)[:width]
+        cells += [""] * (width - len(cells))
+        padded = [f" {str(c):<{w}} " for c, w in zip(cells, widths, strict=True)]
         return "|" + "|".join(padded) + "|"
 
     out = [title, rule, line(headers), rule]

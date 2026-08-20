@@ -188,12 +188,34 @@ def _existing_code(workspace: Workspace) -> str | None:
 
 
 def _latest_workspace(scenario_key: str) -> Path | None:
-    candidates = sorted(
-        (d for d in RUNS.glob("*/workspace") if d.is_dir() and any(d.iterdir())),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
+    """Most recent non-empty workspace produced by a given scenario.
+
+    The scenario has to be matched, not merely accepted. An earlier version
+    took the argument and ignored it, returning whichever run was newest, so
+    running brownfield twice seeded the second run from the first brownfield
+    rather than from greenfield. That stacks a change on top of the same change
+    and produces plausible nonsense, quietly.
+
+    A run's scenario is read from its `summary.json`, which the CLI writes even
+    for a parked run, so identification does not depend on the run id.
+    """
+    matches: list[tuple[float, Path]] = []
+    for workspace in RUNS.glob("*/workspace"):
+        if not workspace.is_dir() or not any(workspace.iterdir()):
+            continue
+        summary = workspace.parent / "summary.json"
+        if not summary.is_file():
+            continue
+        try:
+            if json.loads(summary.read_text()).get("scenario") != scenario_key:
+                continue
+        except (json.JSONDecodeError, OSError):
+            continue
+        matches.append((workspace.stat().st_mtime, workspace))
+
+    if not matches:
+        return None
+    return max(matches)[1]
 
 
 def _write_summary(run_dir, run_id, scenario, intake_result, result, metrics) -> None:

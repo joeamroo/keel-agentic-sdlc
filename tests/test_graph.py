@@ -173,7 +173,9 @@ def test_three_node_cycle_reports_every_member_in_execution_order() -> None:
     # Consecutive pairs must be real edges: the successor depends on the
     # predecessor. That is what makes the path copy-pasteable into a fix.
     by_id = {n.id: n for n in plan.nodes}
-    for before, after in zip(path, path[1:]):
+    # noqa-worthy on purpose: a pairwise window has one fewer pair than items,
+    # so strict=True would be wrong here.
+    for before, after in zip(path, path[1:]):  # noqa: B905
         assert before in by_id[after].depends_on
 
 

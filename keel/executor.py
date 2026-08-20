@@ -37,7 +37,6 @@ from keel.models import (
     NodeResult,
     NodeSpec,
     Plan,
-    StageKind,
     TaskState,
 )
 from keel.planner import VERIFY, Planner

@@ -374,3 +374,98 @@ def test_independent_stages_really_do_overlap_in_a_full_run(tmp_path):
 
     assert result.state is TaskState.COMPLETED
     assert peak >= 2, "no two stages were ever in flight together"
+
+
+def test_the_default_policy_engine_accepts_a_realistically_modular_service(tmp_path):
+    """QA regression built from what a model actually generates.
+
+    The scripted adapter emits one flat `app.py`, which is not the shape real
+    output takes. A live run produced a 13-module service with its SSRF guard
+    in a dedicated `app/urls.py`, and the open-redirect rule denied it because
+    it scanned each file in isolation. This pins the realistic shape so the
+    class of bug cannot come back.
+    """
+    from keel.governance.policy import default_engine
+    from keel.models import Artifact, ImpactLevel, NodeSpec, StageKind
+
+    handler = (
+        "from fastapi.responses import RedirectResponse\n"
+        "from app.urls import ensure_safe_target\n\n"
+        "@router.get('/{code}')\n"
+        "def follow(code: str):\n"
+        "    link = lookup(code)\n"
+        "    ensure_safe_target(link.target)\n"
+        "    return RedirectResponse(link.target, status_code=302)\n"
+    )
+    validator = (
+        "import ipaddress\n"
+        "from urllib.parse import urlparse\n\n"
+        "ALLOWED_SCHEMES = frozenset({'http', 'https'})\n"
+        "BLOCKED = (ipaddress.IPv4Network('127.0.0.0/8'),\n"
+        "           ipaddress.IPv4Network('169.254.0.0/16'))\n\n"
+        "def ensure_safe_target(raw: str) -> None:\n"
+        "    parts = urlparse(raw)\n"
+        "    if parts.scheme not in ALLOWED_SCHEMES:\n"
+        "        raise ValueError('scheme not allowed')\n"
+        "    ip = ipaddress.ip_address(parts.hostname)\n"
+        "    if ip.is_private or ip.is_link_local:\n"
+        "        raise ValueError('internal host not allowed')\n"
+    )
+    artifacts = [
+        Artifact(name="app/main.py", content=handler, produced_by="implement", path="app/main.py"),
+        Artifact(name="app/urls.py", content=validator, produced_by="implement", path="app/urls.py"),
+        Artifact(name="app/db.py", content="def lookup(code):\n    return None\n",
+                 produced_by="implement", path="app/db.py"),
+    ]
+    node = NodeSpec(
+        id="implement", kind=StageKind.IMPLEMENT, description="qa",
+        impact=ImpactLevel.MEDIUM, exit_rules=["files_written"],
+    )
+
+    decision = default_engine(approved_nodes={"implement"}).decide("exit", node, artifacts)
+    assert decision.allowed, f"correct modular code was denied: {decision.reason}"
+
+
+def test_committed_run_evidence_still_passes_policy():
+    """Whatever is committed under runs/ must survive the current rule set.
+
+    The evidence directories are real model output, so they double as a policy
+    regression corpus: a rule change that would have denied a run we shipped
+    shows up here rather than in a reviewer's console.
+    """
+    from pathlib import Path
+
+    from keel.governance.policy import default_engine
+    from keel.models import Artifact, ImpactLevel, NodeSpec, StageKind
+
+    roots = [p for p in Path("runs").glob("*/workspace") if p.is_dir()]
+    if not roots:
+        pytest.skip("no committed run evidence yet")
+
+    node = NodeSpec(
+        id="implement", kind=StageKind.IMPLEMENT, description="qa",
+        impact=ImpactLevel.MEDIUM, exit_rules=["files_written"],
+    )
+    for root in roots:
+        artifacts = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                content = path.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            rel = str(path.relative_to(root))
+            artifacts.append(
+                Artifact(name=rel, content=content, produced_by="implement", path=rel)
+            )
+        if not artifacts:
+            continue
+        blocking = [
+            v for v in default_engine(approved_nodes={"implement"}).evaluate(artifacts, node)
+            if v.blocks
+        ]
+        assert not blocking, (
+            f"committed evidence in {root} would be denied by the current rules: "
+            f"{[(v.rule_id, v.location) for v in blocking]}"
+        )

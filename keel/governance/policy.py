@@ -35,7 +35,6 @@ from keel.models import (
     PolicyRule,
     PolicyViolation,
     Severity,
-    StageKind,
 )
 
 __all__ = [
@@ -334,6 +333,22 @@ class OpenRedirectRule:
 
     def evaluate(self, artifacts: list[Artifact], node: NodeSpec) -> list[PolicyViolation]:
         violations: list[PolicyViolation] = []
+
+        # The guard evidence is gathered across every code artifact the node
+        # produced, not just the file holding the redirect handler.
+        #
+        # A live run made the reason concrete. The generated service put its
+        # redirect in app/main.py and its SSRF validation in a dedicated
+        # app/urls.py, with a scheme allowlist, RFC1918 and link-local network
+        # checks, and the cloud metadata address called out by name. Scanning
+        # per-file could not see it, so the rule denied genuinely correct code.
+        #
+        # That is the worst failure mode available to a guardrail: it punished
+        # good modularity, and because the denial is fed into the retry it
+        # pressured the next attempt to inline the check purely to satisfy the
+        # gate. A gate that distorts the work is worse than no gate.
+        corpus = "\n".join(a.content for a in artifacts if _is_code(a))
+
         for artifact in artifacts:
             if not _is_code(artifact):
                 continue
@@ -364,9 +379,9 @@ class OpenRedirectRule:
                     )
 
             scheme_validated = bool(
-                _SCHEME_ALLOWLIST_NAME.search(content)
-                or _HTTP_PREFIX_CHECK.search(content)
-                or _guarded(content, _SCHEME_TOKEN, _GUARD_ACTION)
+                _SCHEME_ALLOWLIST_NAME.search(corpus)
+                or _HTTP_PREFIX_CHECK.search(corpus)
+                or _guarded(corpus, _SCHEME_TOKEN, _GUARD_ACTION)
             )
             if not scheme_validated:
                 violations.append(
@@ -383,8 +398,8 @@ class OpenRedirectRule:
                 )
 
             host_blocked = bool(
-                _IP_INSPECTION.search(content)
-                or _guarded(content, _INTERNAL_HOST_TOKEN, _GUARD_ACTION)
+                _IP_INSPECTION.search(corpus)
+                or _guarded(corpus, _INTERNAL_HOST_TOKEN, _GUARD_ACTION)
             )
             if not host_blocked:
                 violations.append(
@@ -458,13 +473,23 @@ class DestructiveOperationRule:
         for artifact in artifacts:
             content = artifact.content
 
-            def flag(index: int, message: str, _artifact: Artifact = artifact) -> None:
+            # Both loop variables are bound as defaults. `_artifact` alone was
+            # bound before, which works only because flag() is called
+            # synchronously; binding one and not the other means a later
+            # refactor that defers the call would report the right file with a
+            # line number computed from a different one.
+            def flag(
+                index: int,
+                message: str,
+                _artifact: Artifact = artifact,
+                _content: str = content,
+            ) -> None:
                 violations.append(
                     PolicyViolation(
                         rule_id=self.rule_id,
                         severity=self.severity,
                         message=message,
-                        location=_location(_artifact, _line_of(content, index)),
+                        location=_location(_artifact, _line_of(_content, index)),
                     )
                 )
 

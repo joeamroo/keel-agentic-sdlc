@@ -529,3 +529,24 @@ def test_format_stage_table_lists_every_stage() -> None:
     assert "analyze" in table
     assert "implement" in table
     assert table.count("\n") >= 5
+
+
+def test_a_short_row_does_not_silently_drop_a_table_column() -> None:
+    """Regression: transposing with bare zip truncates to the shortest row.
+
+    A single row with fewer cells than the header would drop a column from the
+    whole table with no error, which is a bad failure for output whose only job
+    is reporting numbers accurately.
+    """
+    from keel.governance.metrics import MetricsCollector
+    from keel.models import RunMetrics
+
+    metrics = RunMetrics(run_id="short-row", total_nodes=1, succeeded=1)
+    rendered = MetricsCollector.format_table(metrics)
+
+    # Every rendered row must have the same number of column separators as the
+    # rule line, or a column went missing somewhere.
+    lines = [ln for ln in rendered.splitlines() if ln.startswith("|")]
+    assert lines, "nothing rendered"
+    widths = {ln.count("|") for ln in lines}
+    assert len(widths) == 1, f"rows disagree on column count: {sorted(widths)}"

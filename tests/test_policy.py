@@ -713,3 +713,73 @@ def test_default_engine_plumbs_approved_nodes_through() -> None:
     high = node("deploy", impact=ImpactLevel.HIGH)
     decision = engine.decide("exit", high, [art("ok", name="release.txt", produced_by="deploy")])
     assert decision.allowed is True
+
+
+# --------------------------------------------------------------------------
+# Regression: the guard may live in a different module from the handler
+# --------------------------------------------------------------------------
+
+REDIRECT_HANDLER = '''
+from fastapi import APIRouter
+from fastapi.responses import RedirectResponse
+from app.urls import ensure_safe_target
+
+router = APIRouter()
+
+
+@router.get("/{code}")
+def follow(code: str):
+    link = lookup(code)
+    ensure_safe_target(link.target)
+    return RedirectResponse(link.target, status_code=302)
+'''
+
+URL_VALIDATOR = '''
+import ipaddress
+from urllib.parse import urlparse
+
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+BLOCKED_NETWORKS = (
+    ipaddress.IPv4Network("127.0.0.0/8"),
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("169.254.0.0/16"),
+)
+CLOUD_METADATA_IPV4 = ipaddress.IPv4Address("169.254.169.254")
+
+
+def ensure_safe_target(raw: str) -> None:
+    parts = urlparse(raw)
+    if parts.scheme not in ALLOWED_SCHEMES:
+        raise ValueError("scheme not allowed")
+    candidate = ipaddress.ip_address(parts.hostname)
+    if candidate.is_private or candidate.is_link_local:
+        raise ValueError("internal host not allowed")
+'''
+
+
+def test_guard_in_a_separate_module_is_recognized() -> None:
+    """Regression from a live run: the rule punished good modularity.
+
+    The generated service put its redirect in app/main.py and its SSRF
+    validation in a dedicated app/urls.py. Evaluating each artifact in
+    isolation could not see the guard, so the rule denied correct code, and
+    because the denial feeds the retry it pressured the next attempt to inline
+    the check purely to satisfy the gate.
+    """
+    artifacts = [
+        art(REDIRECT_HANDLER, name="app/main.py", produced_by="implement"),
+        art(URL_VALIDATOR, name="app/urls.py", produced_by="implement"),
+    ]
+    assert OpenRedirectRule().evaluate(artifacts, node()) == []
+
+
+def test_a_redirect_with_no_guard_anywhere_is_still_flagged() -> None:
+    """The other half: moving the check out must not mean removing it."""
+    artifacts = [
+        art(REDIRECT_HANDLER, name="app/main.py", produced_by="implement"),
+        art("def lookup(code):\n    return None\n", name="app/db.py", produced_by="implement"),
+    ]
+    violations = OpenRedirectRule().evaluate(artifacts, node())
+    assert violations, "an unguarded redirect passed the rule"
+    assert any("scheme" in v.message for v in violations)
+    assert any("internal hosts" in v.message for v in violations)
