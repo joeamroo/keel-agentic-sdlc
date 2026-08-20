@@ -1,0 +1,441 @@
+"""Integration tests for the orchestration engine itself.
+
+These drive the real Executor against a stub dispatcher, so they exercise the
+governance behaviour (gates, retries, fallback, rollback, approval, safe stop,
+re-planning) without a model or a network. That separation is deliberate: the
+value of this project is the orchestration, so the orchestration is what gets
+tested directly rather than inferred from a full run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from keel.dispatch import StageOutcome
+from keel.executor import Executor
+from keel.governance.approvals import AutoApprovalBroker, ScriptedApprovalBroker
+from keel.governance.audit import AuditLog
+from keel.governance.lineage import LineageStore
+from keel.governance.policy import PolicyEngine, SecretScanRule
+from keel.models import (
+    Artifact,
+    AuditEventType,
+    EngineeringProblem,
+    ImpactLevel,
+    ModelTier,
+    NodeSpec,
+    Plan,
+    RetryPolicy,
+    ScenarioKind,
+    StageKind,
+    TaskState,
+)
+from keel.planner import Planner
+from keel.workspace import Workspace
+
+
+class StubDispatcher:
+    """Returns scripted outcomes per node, and counts how often it was asked."""
+
+    def __init__(self, script: dict[str, list[StageOutcome]]):
+        self.script = {k: list(v) for k, v in script.items()}
+        self.calls: list[tuple[str, ModelTier]] = []
+
+    async def dispatch(self, node_id, skill_id, tier, payload):
+        self.calls.append((node_id, tier))
+        queue = self.script.get(node_id)
+        if not queue:
+            return StageOutcome(state=TaskState.COMPLETED, parsed={"ok": True})
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    def count(self, node_id: str) -> int:
+        return sum(1 for n, _ in self.calls if n == node_id)
+
+
+def ok(name: str = "out.json", content: str = '{"ok": true}') -> StageOutcome:
+    return StageOutcome(
+        state=TaskState.COMPLETED,
+        artifacts=[Artifact(name=name, content=content, produced_by="stub")],
+        parsed={"ok": True},
+    )
+
+
+def fail(msg: str = "boom") -> StageOutcome:
+    return StageOutcome(state=TaskState.FAILED, message=msg)
+
+
+def build(tmp_path: Path, plan: Plan, script=None, approvals=None, policy=None):
+    workspace = Workspace(tmp_path / "ws")
+    dispatcher = StubDispatcher(script or {})
+    audit = AuditLog("test-run", tmp_path / "runs")
+    executor = Executor(
+        run_id="test-run",
+        dispatcher=dispatcher,
+        workspace=workspace,
+        audit=audit,
+        policy=policy or PolicyEngine([]),
+        lineage=LineageStore(),
+        approvals=approvals or AutoApprovalBroker(approve=True),
+        planner=Planner(),
+    )
+    return executor, dispatcher, audit, workspace
+
+
+def node(nid, deps=(), **kw) -> NodeSpec:
+    return NodeSpec(
+        id=nid,
+        kind=kw.pop("kind", StageKind.IMPLEMENT),
+        description=nid,
+        depends_on=list(deps),
+        skill_id=kw.pop("skill_id", "implement"),
+        **kw,
+    )
+
+
+PROBLEM = EngineeringProblem(
+    raw_requirement="build a thing",
+    intent="build a thing",
+    confidence=0.9,
+    scenario=ScenarioKind.GREENFIELD,
+)
+
+
+def test_linear_plan_runs_to_completion(tmp_path):
+    plan = Plan(nodes=[node("a"), node("b", ["a"])])
+    ex, disp, audit, _ = build(tmp_path, plan, {"a": [ok()], "b": [ok()]})
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.COMPLETED
+    assert {n: r.state for n, r in result.results.items()} == {
+        "a": TaskState.COMPLETED,
+        "b": TaskState.COMPLETED,
+    }
+    assert [n for n, _ in disp.calls] == ["a", "b"]
+
+
+def test_independent_nodes_dispatch_concurrently(tmp_path):
+    """The two branches of a diamond must be in flight at the same time.
+
+    Asserting on ordering alone would pass for a sequential executor, so this
+    measures actual overlap instead.
+    """
+    plan = Plan(
+        nodes=[node("root"), node("l", ["root"]), node("r", ["root"]), node("join", ["l", "r"])]
+    )
+    ex, disp, _, _ = build(tmp_path, plan)
+
+    in_flight = 0
+    peak = 0
+
+    async def slow_dispatch(node_id, skill_id, tier, payload):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return ok()
+
+    disp.dispatch = slow_dispatch
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.COMPLETED
+    assert peak >= 2, "independent nodes did not overlap, so nothing ran in parallel"
+
+
+def test_failure_is_retried_up_to_the_budget_then_fails(tmp_path):
+    spec = node("a", retry=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
+    plan = Plan(nodes=[spec])
+    ex, disp, audit, _ = build(tmp_path, plan, {"a": [fail()]})
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.FAILED
+    # max_attempts=2 means the initial try plus two retries.
+    assert disp.count("a") == 3
+    assert result.results["a"].attempts == 3
+    assert result.results["a"].used_fallback is True
+    assert any(e.event_type is AuditEventType.RETRY for e in audit.events())
+    assert any(e.event_type is AuditEventType.FALLBACK for e in audit.events())
+
+
+def test_transient_failure_recovers_on_retry(tmp_path):
+    spec = node("a", retry=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
+    plan = Plan(nodes=[spec])
+    ex, disp, _, _ = build(tmp_path, plan, {"a": [fail(), ok()]})
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.COMPLETED
+    assert result.results["a"].attempts == 2
+
+
+def test_exit_gate_denial_rolls_the_workspace_back(tmp_path):
+    """A node that trips policy must leave nothing behind."""
+    leaked = 'ANTHROPIC_KEY = "' + "sk-ant" + '-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
+    spec = node("a", retry=RetryPolicy(max_attempts=0, backoff_seconds=0.0))
+    plan = Plan(nodes=[spec])
+
+    outcome = StageOutcome(
+        state=TaskState.COMPLETED,
+        artifacts=[Artifact(name="app.py", content=leaked, produced_by="stub", path="app.py")],
+        parsed={},
+    )
+    ex, _, audit, ws = build(
+        tmp_path, plan, {"a": [outcome]}, policy=PolicyEngine([SecretScanRule()])
+    )
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.FAILED
+    assert result.results["a"].rolled_back is True
+    assert ws.list_files() == [], "the leaked file survived rollback"
+    assert any(e.event_type is AuditEventType.ROLLBACK for e in audit.events())
+    assert any(e.event_type is AuditEventType.POLICY_VIOLATION for e in audit.events())
+
+
+def test_a_retry_is_told_why_the_previous_attempt_was_rejected(tmp_path):
+    """A retry that repeats the same prompt gets the same answer.
+
+    Observed live: the implement stage produced code missing its open-redirect
+    guard, the exit gate correctly denied it, and the retry re-sent the original
+    prompt unchanged. Without the gate's reasons the second attempt is a fresh
+    roll of the dice at full cost, so the retry budget buys nothing.
+    """
+    leaked = 'KEY = "' + "sk-ant" + '-api03-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"'
+    spec = node("a", retry=RetryPolicy(max_attempts=1, backoff_seconds=0.0))
+    plan = Plan(nodes=[spec])
+
+    prompts: list[str] = []
+
+    ex, disp, _, _ = build(tmp_path, plan, policy=PolicyEngine([SecretScanRule()]))
+
+    async def capture(node_id, skill_id, tier, payload):
+        prompts.append(payload["requirement"])
+        return StageOutcome(
+            state=TaskState.COMPLETED,
+            artifacts=[Artifact(name="a.py", content=leaked, produced_by="a", path="a.py")],
+            parsed={},
+        )
+
+    disp.dispatch = capture
+    asyncio.run(ex.run(PROBLEM, plan))
+
+    assert len(prompts) == 2, "the node did not retry"
+    assert "security.secret_scan" not in prompts[0], "the first attempt was pre-poisoned"
+    assert "security.secret_scan" in prompts[1], (
+        "the retry was not told which rule rejected it"
+    )
+    assert "a.py" in prompts[1], "the retry was not told where the problem was"
+
+
+def test_rollback_does_not_destroy_a_concurrent_sibling(tmp_path):
+    """Regression: a failing node must not revert work a parallel node committed.
+
+    Found in a live run. Three nodes ran in one level; the documentation node
+    finished and wrote README.md, then the test-authoring node failed its exit
+    gate and rolled back. Rollback restored the whole workspace snapshot, which
+    had been taken before README.md existed, so the successful node's output
+    was deleted by its neighbour's failure.
+    """
+    leaked = 'KEY = "' + "sk-ant" + '-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"'
+    plan = Plan(
+        nodes=[
+            node("root"),
+            node("good", ["root"]),
+            node("bad", ["root"], retry=RetryPolicy(max_attempts=0, backoff_seconds=0.0)),
+        ]
+    )
+
+    ex, disp, _, ws = build(tmp_path, plan, policy=PolicyEngine([SecretScanRule()]))
+
+    # The two must genuinely interleave, or the bug hides. Both nodes have to
+    # snapshot before either writes; the failing one then rolls back after the
+    # succeeding one has already committed. Without the awaits below, gather
+    # runs them to completion in turn, `bad` snapshots after README.md already
+    # exists, and a global restore looks harmless.
+    async def interleaved(node_id, skill_id, tier, payload):
+        if node_id == "root":
+            return ok()
+        if node_id == "good":
+            await asyncio.sleep(0.02)
+            return StageOutcome(
+                state=TaskState.COMPLETED,
+                artifacts=[
+                    Artifact(
+                        name="README.md", content="# docs", produced_by="good", path="README.md"
+                    )
+                ],
+                parsed={},
+            )
+        await asyncio.sleep(0.08)  # commits after `good` has landed
+        return StageOutcome(
+            state=TaskState.COMPLETED,
+            artifacts=[
+                Artifact(name="leak.py", content=leaked, produced_by="bad", path="leak.py")
+            ],
+            parsed={},
+        )
+
+    disp.dispatch = interleaved
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.results["bad"].rolled_back is True
+    assert "leak.py" not in ws.list_files(), "the failing node's output survived"
+    assert "README.md" in ws.list_files(), (
+        "rollback deleted a concurrent sibling's committed output"
+    )
+
+
+def test_authoring_tests_is_not_asked_for_a_transcript_it_cannot_have(tmp_path):
+    """Regression: the evidence rule must key on the declared contract.
+
+    A plan has two nodes of kind TEST. One writes the suite, one runs it. Only
+    the second can produce a transcript, so keying the rule on StageKind made
+    the first fail a rule it could never satisfy, on every retry, forever.
+    """
+    from keel.governance.policy import TestEvidenceRule
+
+    author = node(
+        "author-tests",
+        kind=StageKind.TEST,
+        skill_id="test",
+        exit_rules=["files_written"],
+    )
+    plan = Plan(nodes=[author])
+    outcome = StageOutcome(
+        state=TaskState.COMPLETED,
+        artifacts=[
+            Artifact(
+                name="tests/test_x.py",
+                content="def test_x():\n    assert True\n",
+                produced_by="author-tests",
+                path="tests/test_x.py",
+            )
+        ],
+        parsed={},
+    )
+    ex, _, _, ws = build(
+        tmp_path, plan, {"author-tests": [outcome]}, policy=PolicyEngine([TestEvidenceRule()])
+    )
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.COMPLETED
+    assert "tests/test_x.py" in ws.list_files()
+
+
+def test_a_node_that_claims_it_ran_tests_still_needs_a_transcript(tmp_path):
+    """The other half of the same rule: declaring `tests_executed` obliges you."""
+    from keel.governance.policy import TestEvidenceRule
+
+    runner = node(
+        "verify",
+        kind=StageKind.TEST,
+        skill_id="test",
+        exit_rules=["tests_executed"],
+        retry=RetryPolicy(max_attempts=0, backoff_seconds=0.0),
+    )
+    plan = Plan(nodes=[runner])
+    outcome = StageOutcome(
+        state=TaskState.COMPLETED,
+        artifacts=[
+            Artifact(
+                name="verify.txt",
+                content="all tests pass, the suite is green",
+                produced_by="verify",
+            )
+        ],
+        parsed={},
+    )
+    ex, _, _, _ = build(
+        tmp_path, plan, {"verify": [outcome]}, policy=PolicyEngine([TestEvidenceRule()])
+    )
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.FAILED, "a claimed pass with no transcript was accepted"
+
+
+def test_denied_approval_rejects_the_node_without_running_it(tmp_path):
+    spec = node("a", impact=ImpactLevel.HIGH)
+    plan = Plan(nodes=[spec])
+    ex, disp, audit, _ = build(
+        tmp_path, plan, {"a": [ok()]}, approvals=ScriptedApprovalBroker({"a": False})
+    )
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.results["a"].state is TaskState.REJECTED
+    assert disp.count("a") == 0, "work ran despite the human declining it"
+    assert any(e.event_type is AuditEventType.APPROVAL_REQUESTED for e in audit.events())
+
+
+def test_input_required_parks_the_run_rather_than_failing(tmp_path):
+    plan = Plan(nodes=[node("a"), node("b", ["a"])])
+    parked = StageOutcome(state=TaskState.INPUT_REQUIRED, message="which auth model?")
+    ex, disp, _, _ = build(tmp_path, plan, {"a": [parked]})
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.INPUT_REQUIRED
+    assert result.pending_questions == ["which auth model?"]
+    assert disp.count("b") == 0, "downstream work ran while waiting on a human"
+
+
+def test_safe_stop_finishes_the_current_node_and_starts_no_more(tmp_path):
+    plan = Plan(nodes=[node("a"), node("b", ["a"])])
+    ex, disp, audit, _ = build(tmp_path, plan)
+
+    async def stop_after_first(node_id, skill_id, tier, payload):
+        ex.request_stop()
+        return ok()
+
+    disp.dispatch = stop_after_first
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.FAILED
+    assert "stop requested" in result.stopped_reason
+    assert "a" in result.results and "b" not in result.results
+    assert any(e.event_type is AuditEventType.SAFE_STOP for e in audit.events())
+
+
+def test_cheap_tier_is_actually_used_for_cheap_nodes(tmp_path):
+    """The cost-routing decision has to show up in real dispatch calls."""
+    plan = Plan(
+        nodes=[
+            node("deep", model_tier=ModelTier.DEEP),
+            node("cheap", ["deep"], model_tier=ModelTier.FAST),
+        ]
+    )
+    ex, disp, _, _ = build(tmp_path, plan)
+
+    asyncio.run(ex.run(PROBLEM, plan))
+
+    assert dict(disp.calls) == {"deep": ModelTier.DEEP, "cheap": ModelTier.FAST}
+
+
+def test_audit_log_records_every_gate_decision(tmp_path):
+    plan = Plan(nodes=[node("a")])
+    ex, _, audit, _ = build(tmp_path, plan, {"a": [ok()]})
+
+    asyncio.run(ex.run(PROBLEM, plan))
+
+    gates = [e for e in audit.events() if e.event_type is AuditEventType.GATE_DECISION]
+    assert {g.payload["gate"] for g in gates} == {"entry", "exit"}
+    assert all("reason" in g.payload for g in gates), "a gate decision with no reason is not auditable"
+
+
+def test_run_is_bookended_in_the_audit_log(tmp_path):
+    plan = Plan(nodes=[node("a")])
+    ex, _, audit, _ = build(tmp_path, plan, {"a": [ok()]})
+
+    asyncio.run(ex.run(PROBLEM, plan))
+    kinds = [e.event_type for e in audit.events()]
+
+    assert kinds[0] is AuditEventType.RUN_STARTED
+    assert kinds[-1] is AuditEventType.RUN_FINISHED
+    assert AuditEventType.PLAN_CREATED in kinds
