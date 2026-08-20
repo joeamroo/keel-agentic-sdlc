@@ -70,7 +70,7 @@ Being precise about this, because the difference matters to anyone evaluating th
 | greenfield | all seven nodes, verification passed | yes, end to end |
 | ambiguous (park) | intake refusing to plan | yes |
 | ambiguous (resumed) | all seven nodes after the questions were answered | up to verification |
-| brownfield | impact analysis, design, approval, implementation, test authoring | no, see below |
+| brownfield | all stages through verification, plus a repair attempt | no, see below |
 
 The resumed run completed live. Its replay stops at verification with 89 of 91
 generated tests passing, because replay cannot regenerate code: the recorded
@@ -86,15 +86,15 @@ implementation that genuinely modified the generated code (it added
 `app/apikeys.py` and changed `config.py`, `db.py`, `main.py`, `errors.py` and
 `ratelimit.py`).
 
-It also contains two failures, and they are the reason it is worth reading. Its
-verification node was rejected at the entry gate for an unguarded redirect that
-was not there, because the gate was scanning a truncated JSON summary of its
-upstream's output. The repair loop then fired twice trying to fix an
-implementation that had not caused it. Both are fixed, both are regression
-tested, and the audit log of the run that exposed them is this file. I ran out
-of API budget before I could re-record it against the fixed code, so the
-recording predates the fix and does not replay to completion. `keel run
---scenario brownfield --mode live` re-records it in about twenty minutes.
+It is also the only recording that shows the **repair loop firing on real
+work**. Verification ran the generated suite, the suite failed, and rather than
+stopping the run discarded the implementation and began regenerating it with the
+failing transcript in hand. The API budget funding the run ran out during that
+regeneration, so the recording ends mid-repair.
+
+That makes it a partial run rather than a green one, and it is committed as
+evidence rather than as a demo. `keel run --scenario brownfield --mode live`
+completes it in about twenty minutes with a funded key.
 
 ## What each run leaves behind
 

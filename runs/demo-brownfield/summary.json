@@ -13,46 +13,67 @@
     "scenario_detected": "brownfield",
     "ambiguities": [
       {
-        "question": "Is the per-key window fixed at 60 seconds, or does it reuse the configurable LINKS_RATE_LIMIT_WINDOW_SECONDS (default 60)?",
-        "why": "If an operator sets LINKS_RATE_LIMIT_WINDOW_SECONDS=30, a reused window makes 'alpha:100' mean 100 per 30s while a fixed window keeps it 100 per 60s; it also decides whether Retry-After can exceed the configured window and how tests can exercise expiry without sleeping a minute.",
+        "question": "Should a key's quota window be a fixed 60 seconds, or should it follow LINKS_RATE_LIMIT_WINDOW_SECONDS like the per-IP limiter?",
+        "why": "It decides whether the key bucket carries its own hard-coded 60-second window (and a Retry-After capped at 60) or reuses settings.rate_limit_window_seconds, which changes both the limiter code path and the upper bound asserted on Retry-After.",
         "blocking": false
       },
       {
-        "question": "Does a request with a known key also count against, and get rejected by, the existing per-IP creation bucket?",
-        "why": "If both buckets apply, an alpha key with quota 100 is still capped at LINKS_RATE_LIMIT_MAX=10 per IP and the feature is inert at default configuration; if only the key bucket applies, the key genuinely raises the ceiling.",
-        "blocking": false
-      },
-      {
-        "question": "How should unusable entries in SHORTENER_API_KEYS be treated \u2014 skipped, or fatal?",
-        "why": "Determines whether a typo such as 'beta:xx' or a duplicate key name silently drops one key or refuses to start the service, and whether 'gamma:0' means block-all or invalid.",
+        "question": "Does a request carrying a known key also consume the per-IP creation budget, or only the key budget?",
+        "why": "If both apply, a key with quota 100 is still capped at LINKS_RATE_LIMIT_MAX=10 per address and the feature is useless; if only the key applies, the middleware must skip the IP bucket for keyed creations.",
         "blocking": false
       },
       {
         "question": "Does LINKS_RATE_LIMIT_ENABLED=false also disable per-key limiting?",
-        "why": "Decides whether test and dev deployments that set the flag can still be throttled by key, and whether the existing kill switch remains a single master switch.",
+        "why": "It determines whether the key check sits inside or outside the existing early-return guard in RateLimitMiddleware.__call__.",
         "blocking": false
       },
       {
-        "question": "Should the 429 (or the 201) carry advisory X-RateLimit-Limit/Remaining/Reset headers for keyed callers?",
-        "why": "Adds response headers to the create contract that clients may begin to depend on and that would need documenting; omitting keeps the contract identical apart from Retry-After.",
+        "question": "How should malformed or duplicate entries in SHORTENER_API_KEYS be handled?",
+        "why": "Decides whether the process refuses to start, silently drops the bad pair, or clamps the quota, and what the parser returns for 'alpha' with no colon, 'beta:abc', 'gamma:0' and a repeated name.",
+        "blocking": false
+      },
+      {
+        "question": "Should the 429 response add informational rate-limit headers (X-RateLimit-Limit / -Remaining) alongside Retry-After?",
+        "why": "Adds headers to the response contract that clients may start depending on and that tests would need to pin.",
         "blocking": false
       }
     ]
   },
   "run": {
     "state": "failed",
-    "stopped_reason": "design failed: APIStatusError: {'type': 'error', 'error': {'details': None, 'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CeDawtJVar2iNe6Lx1yJo'}",
+    "stopped_reason": "implement failed: APIStatusError: {'type': 'error', 'error': {'details': None, 'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CeDt2rPX24AkSzP2G28FB'}",
     "plan_version": 1,
     "plan_revisions": 0,
     "nodes": {
       "impact-analysis": {
         "state": "completed",
+        "attempts": 2,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 207.17
+      },
+      "design": {
+        "state": "completed",
+        "attempts": 3,
+        "rolled_back": false,
+        "used_fallback": true,
+        "duration": 466.927
+      },
+      "author-tests": {
+        "state": "completed",
         "attempts": 1,
         "rolled_back": false,
         "used_fallback": false,
-        "duration": 108.144
+        "duration": 487.914
       },
-      "design": {
+      "document": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 27.375
+      },
+      "implement": {
         "state": "failed",
         "attempts": 1,
         "rolled_back": false,
@@ -63,19 +84,19 @@
   },
   "metrics": {
     "run_id": "demo-brownfield",
-    "total_nodes": 2,
-    "succeeded": 1,
+    "total_nodes": 5,
+    "succeeded": 4,
     "failed": 1,
-    "retries": 0,
+    "retries": 3,
     "rollbacks": 0,
-    "fallbacks": 0,
-    "approvals_requested": 0,
+    "fallbacks": 1,
+    "approvals_requested": 2,
     "plan_revisions": 0,
-    "e2e_latency_seconds": 186.25777006149292,
-    "mttr_seconds": null,
-    "cost_usd": 0.42184,
-    "input_tokens": 40803,
-    "output_tokens": 8713,
-    "success_rate": 0.5
+    "e2e_latency_seconds": 1236.9995279312134,
+    "mttr_seconds": 209.51272535324097,
+    "cost_usd": 3.296469,
+    "input_tokens": 176600,
+    "output_tokens": 104357,
+    "success_rate": 0.8
   }
 }

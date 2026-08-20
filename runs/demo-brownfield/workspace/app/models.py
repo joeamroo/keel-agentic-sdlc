@@ -1,53 +1,65 @@
-"""Typed request and response models validated at the service boundary.
+"""Typed request and response models validated at the HTTP boundary.
 
-Request models run in pydantic strict mode with ``extra="forbid"``: invalid
-input is rejected rather than coerced, and every string carries a length limit
-before it can reach the database.
+The request model runs in pydantic strict mode: values of the wrong type are
+rejected rather than coerced, and unknown fields are refused.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import ABSOLUTE_MAX_TTL_SECONDS, ABSOLUTE_MAX_URL_LENGTH
+# Absolute ceiling for the url field. The per-deployment limit
+# (LINKS_MAX_URL_LENGTH) is applied on top of this in the route and can only be
+# smaller, so nothing longer than this ever reaches the database.
+MAX_URL_FIELD_LENGTH = 8192
+MAX_TTL_FIELD_VALUE = 1_000_000_000
 
 
 class CreateLinkRequest(BaseModel):
-    """Payload accepted by ``POST /api/links``."""
+    """Body of ``POST /api/links``."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    target_url: str = Field(min_length=1, max_length=ABSOLUTE_MAX_URL_LENGTH)
-    expires_in_seconds: Optional[int] = Field(default=None, ge=0, le=ABSOLUTE_MAX_TTL_SECONDS)
+    url: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_URL_FIELD_LENGTH,
+        description="Absolute http or https target URL.",
+    )
+    ttl_seconds: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=MAX_TTL_FIELD_VALUE,
+        description="Lifetime in seconds. 0 or omitted uses the configured default.",
+    )
 
 
 class CreateLinkResponse(BaseModel):
-    """Body returned by ``POST /api/links``."""
+    """Body of a successful ``POST /api/links``."""
 
     code: str
     short_url: str
     target_url: str
-    created_at: datetime
-    expires_at: Optional[datetime] = None
+    created_at: str
+    expires_at: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
-    """Body returned by ``GET /api/links/{code}/stats``."""
+    """Body of ``GET /api/links/{code}/stats``."""
 
     code: str
-    short_url: str
     target_url: str
-    created_at: datetime
-    expires_at: Optional[datetime] = None
-    expired: bool
-    clicks: int
-    last_clicked_at: Optional[datetime] = None
+    created_at: str
+    expires_at: Optional[str] = None
+    click_count: int
+    last_clicked_at: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
-    """Body returned by ``GET /health``."""
+    """Body of ``GET /health``."""
 
     status: str
+    service: str
+    time: str

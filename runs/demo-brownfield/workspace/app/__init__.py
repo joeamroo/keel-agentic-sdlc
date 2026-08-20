@@ -1,9 +1,4 @@
-"""URL shortener service package.
-
-Exposes the FastAPI application factory used by the ASGI server and by tests.
-"""
-
-from __future__ import annotations
+"""URL shortener application package."""
 
 __all__ = ["__version__"]
 

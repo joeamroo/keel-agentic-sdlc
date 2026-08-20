@@ -1,59 +1,68 @@
-"""Target URL validation and normalisation.
+"""Validation of user supplied target URLs.
 
-Only ``http`` and ``https`` URLs are accepted (allowlist, not a blocklist).
-Embedded credentials are rejected, hosts are resolved and every resulting
-address must be a public unicast address; the cloud metadata address
-169.254.169.254 is denied explicitly.  The normalised value returned here is
-the value that is stored and later served as the redirect Location.
+A URL is only stored after it passes every check here, and the stored value is
+exactly what is later served as a redirect ``Location``, so nothing that skipped
+validation can be reached.
+
+Policy:
+  * only the ``http`` and ``https`` schemes are accepted, by allow-list;
+  * embedded credentials are rejected;
+  * the host is resolved and every resolved address must be a global unicast
+    address. Loopback, private, link-local, multicast, reserved and unspecified
+    addresses are rejected, with 169.254.169.254 (the cloud metadata endpoint)
+    denied explicitly.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
-from typing import Optional, Union
-from urllib.parse import quote, urlsplit, urlunsplit
+from typing import List, Union
+from urllib.parse import urlsplit, urlunsplit
+
+logger = logging.getLogger("app.urls")
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
-METADATA_ADDRESSES = frozenset({"169.254.169.254", "fd00:ec2::254"})
-MAX_HOST_LENGTH = 255
 
-_SAFE_PATH = "/%:@!$&'()*+,;=~-._"
-_SAFE_QUERY = "/?%:@!$&'()*+,;=~-._"
+# Cloud metadata endpoints. 169.254.169.254 is already covered by the
+# link-local rule but is denied by name because reaching it is how a URL
+# handler becomes a credential leak.
+METADATA_ADDRESSES = frozenset({"169.254.169.254", "fd00:ec2::254"})
+
+MAX_HOSTNAME_LENGTH = 253
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 
-class UrlValidationError(ValueError):
-    """Raised when a supplied target URL is malformed or unsafe."""
+class InvalidURLError(ValueError):
+    """Raised when a target URL may not be stored or served."""
 
 
-def _parse_ip_literal(host: str) -> Optional[IPAddress]:
-    """Parse a host as an IP literal.
+def _normalise_ip(ip: IPAddress) -> IPAddress:
+    """Unwrap IPv4-in-IPv6 representations.
 
-    Returns the parsed address, or ``None`` when the host is not an IP literal.
-    Raises nothing.
+    Returns the embedded IPv4 address for mapped and 6to4 addresses, otherwise
+    the address unchanged. Raises nothing.
     """
-    try:
-        return ipaddress.ip_address(host)
-    except ValueError:
-        return None
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        if ip.sixtofour is not None:
+            return ip.sixtofour
+    return ip
 
 
-def _assert_ip_allowed(address: IPAddress) -> None:
-    """Reject addresses that must never be fetched or redirected to.
+def is_forbidden_address(ip: IPAddress) -> bool:
+    """Report whether an IP address must not be used as a redirect target.
 
-    Returns ``None`` when the address is a public unicast address.  Raises
-    :class:`UrlValidationError` for loopback, private, link-local, multicast,
-    reserved, unspecified or metadata addresses.
+    Returns True for loopback, private, link-local, multicast, reserved,
+    unspecified, metadata and any other non globally routable address. Raises
+    nothing.
     """
-    candidate: IPAddress = address
-    if isinstance(candidate, ipaddress.IPv6Address):
-        mapped = candidate.ipv4_mapped
-        if mapped is not None:
-            candidate = mapped
+    candidate = _normalise_ip(ip)
     if str(candidate) in METADATA_ADDRESSES:
-        raise UrlValidationError("target_url host resolves to a blocked address")
+        return True
     if (
         candidate.is_loopback
         or candidate.is_private
@@ -61,110 +70,120 @@ def _assert_ip_allowed(address: IPAddress) -> None:
         or candidate.is_multicast
         or candidate.is_reserved
         or candidate.is_unspecified
-        or not candidate.is_global
     ):
-        raise UrlValidationError("target_url host resolves to a non-public address")
+        return True
+    return not candidate.is_global
 
 
-def _normalise_host(hostname: str) -> str:
-    """Normalise a hostname to lowercase ASCII (IDNA encoded when needed).
+def _resolve(hostname: str, port: int) -> List[str]:
+    """Resolve a hostname to the list of textual IP addresses it points at.
 
-    Returns the ASCII hostname.  Raises :class:`UrlValidationError` when the
-    host is empty, too long or cannot be IDNA encoded.
+    Returns a non-empty list of address strings. Raises InvalidURLError when
+    resolution fails or yields nothing usable.
     """
-    host = hostname.strip()
-    if not host:
-        raise UrlValidationError("target_url must include a host")
-    if len(host) > MAX_HOST_LENGTH:
-        raise UrlValidationError("target_url host is too long")
-    if host.isascii():
-        return host.lower()
     try:
-        return host.encode("idna").decode("ascii").lower()
-    except (UnicodeError, ValueError) as exc:
-        raise UrlValidationError("target_url host is not a valid domain name") from exc
-
-
-def _assert_host_allowed(host: str) -> None:
-    """Resolve a host and reject it when any address is not public.
-
-    Returns ``None`` when every resolved address is a public unicast address.
-    Raises :class:`UrlValidationError` when the host cannot be resolved or maps
-    to a blocked address.
-    """
-    literal = _parse_ip_literal(host)
-    if literal is not None:
-        _assert_ip_allowed(literal)
-        return
-    lowered = host.lower().rstrip(".")
-    if lowered == "localhost" or lowered.endswith(".localhost"):
-        raise UrlValidationError("target_url host resolves to a non-public address")
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError, OSError) as exc:
-        raise UrlValidationError("target_url host could not be resolved") from exc
-    if not infos:
-        raise UrlValidationError("target_url host could not be resolved")
+        raise InvalidURLError("The host of the target url could not be resolved.") from exc
+    addresses: List[str] = []
     for info in infos:
         sockaddr = info[4]
-        raw_address = str(sockaddr[0]).split("%", 1)[0]
-        try:
-            address = ipaddress.ip_address(raw_address)
-        except ValueError as exc:
-            raise UrlValidationError("target_url host could not be resolved") from exc
-        _assert_ip_allowed(address)
+        if not sockaddr:
+            continue
+        address = sockaddr[0]
+        if isinstance(address, str) and address:
+            addresses.append(address.split("%", 1)[0])
+    if not addresses:
+        raise InvalidURLError("The host of the target url could not be resolved.")
+    return addresses
 
 
-def validate_target_url(raw_url: str, max_length: int) -> str:
-    """Validate a user supplied target URL and return its normalised form.
+def validate_target_url(raw: str, max_length: int) -> str:
+    """Validate and normalise a user supplied target URL.
 
-    The returned ASCII URL is the value that must be stored and later served as
-    the redirect destination.  Raises :class:`UrlValidationError` when the URL
-    is empty, too long, contains control characters or credentials, uses a
-    scheme other than http/https, or resolves to a non-public address.
+    Returns the normalised absolute URL that must be stored and later served.
+    Raises InvalidURLError when the URL is empty, too long, malformed, uses a
+    scheme other than http/https, embeds credentials, or resolves to an address
+    that is not globally routable.
     """
-    candidate = raw_url.strip()
+    candidate = raw.strip()
     if not candidate:
-        raise UrlValidationError("target_url must not be empty")
+        raise InvalidURLError("A target url is required.")
     if len(candidate) > max_length:
-        raise UrlValidationError(f"target_url must be at most {max_length} characters")
-    for char in candidate:
-        if ord(char) < 0x20 or ord(char) == 0x7F:
-            raise UrlValidationError("target_url must not contain control characters")
-    try:
-        split = urlsplit(candidate)
-    except ValueError as exc:
-        raise UrlValidationError("target_url is not a valid URL") from exc
+        raise InvalidURLError(
+            "The target url exceeds the maximum length of %d characters." % max_length
+        )
+    for character in candidate:
+        if ord(character) < 0x20 or ord(character) == 0x7F:
+            raise InvalidURLError("The target url contains control characters.")
 
-    scheme = split.scheme.lower()
+    try:
+        parts = urlsplit(candidate)
+    except ValueError as exc:
+        raise InvalidURLError("The target url could not be parsed.") from exc
+
+    scheme = parts.scheme.lower()
     if scheme not in ALLOWED_SCHEMES:
-        raise UrlValidationError("target_url scheme must be http or https")
-    if "@" in split.netloc or split.username or split.password:
-        raise UrlValidationError("target_url must not contain embedded credentials")
+        raise InvalidURLError("Only http and https target urls are allowed.")
+    if not parts.netloc:
+        raise InvalidURLError("The target url must include a host.")
+    if "@" in parts.netloc:
+        raise InvalidURLError("Embedded credentials are not allowed in the target url.")
 
-    hostname = split.hostname
-    if not hostname:
-        raise UrlValidationError("target_url must include a host")
     try:
-        port = split.port
+        hostname = parts.hostname
+        port = parts.port
     except ValueError as exc:
-        raise UrlValidationError("target_url has an invalid port") from exc
-    if port is not None and not (1 <= port <= 65535):
-        raise UrlValidationError("target_url has an invalid port")
+        raise InvalidURLError("The target url has an invalid host or port.") from exc
 
-    host_ascii = _normalise_host(hostname)
-    _assert_host_allowed(host_ascii)
+    if not hostname:
+        raise InvalidURLError("The target url must include a host.")
+    if port is not None and not 1 <= port <= 65535:
+        raise InvalidURLError("The target url has an invalid port.")
 
-    netloc_host = f"[{host_ascii}]" if ":" in host_ascii else host_ascii
-    netloc = netloc_host if port is None else f"{netloc_host}:{port}"
+    literal_ip = None
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_ip = None
 
-    path = quote(split.path, safe=_SAFE_PATH)
-    query = quote(split.query, safe=_SAFE_QUERY)
-    fragment = quote(split.fragment, safe=_SAFE_QUERY)
-    normalised = urlunsplit((scheme, netloc, path, query, fragment))
+    if literal_ip is not None:
+        ascii_host = str(literal_ip)
+        addresses = [ascii_host]
+    else:
+        host = hostname.rstrip(".")
+        if not host:
+            raise InvalidURLError("The target url must include a host.")
+        try:
+            ascii_host = host.encode("idna").decode("ascii").lower()
+        except (UnicodeError, UnicodeDecodeError) as exc:
+            raise InvalidURLError(
+                "The host of the target url is not a valid domain name."
+            ) from exc
+        if len(ascii_host) > MAX_HOSTNAME_LENGTH:
+            raise InvalidURLError("The host of the target url is too long.")
+        default_port = 443 if scheme == "https" else 80
+        addresses = _resolve(ascii_host, port if port is not None else default_port)
 
-    if not normalised.isascii():
-        raise UrlValidationError("target_url must be representable in ASCII")
+    for address in addresses:
+        try:
+            resolved = ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise InvalidURLError(
+                "The host of the target url resolved to an unusable address."
+            ) from exc
+        if is_forbidden_address(resolved):
+            raise InvalidURLError("The target url resolves to a blocked network address.")
+
+    if isinstance(literal_ip, ipaddress.IPv6Address) or (literal_ip is None and ":" in ascii_host):
+        host_part = "[%s]" % ascii_host
+    else:
+        host_part = ascii_host
+    netloc = host_part if port is None else "%s:%d" % (host_part, port)
+
+    normalised = urlunsplit((scheme, netloc, parts.path, parts.query, parts.fragment))
     if len(normalised) > max_length:
-        raise UrlValidationError(f"target_url must be at most {max_length} characters")
+        raise InvalidURLError(
+            "The target url exceeds the maximum length of %d characters." % max_length
+        )
     return normalised

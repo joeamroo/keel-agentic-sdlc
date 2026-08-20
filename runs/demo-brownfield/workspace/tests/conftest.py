@@ -1,432 +1,421 @@
-"""Shared fixtures for the link shortener suite.
+"""Shared fixtures for the URL shortener suite.
 
-Every test gets: a brand new SQLite file (LINKS_DB_PATH), a freshly imported
-application module (so module level configuration is re-read and the in-process
-rate limiter state starts empty), and a stubbed name resolver so that no test
-ever touches the network.
+Every test gets a freshly constructed application (so the in-process rate
+limiter starts with empty buckets) backed by its own SQLite file underneath
+``tmp_path``, plus a stubbed name resolver so that no test ever performs DNS or
+network I/O.  Nothing is shared between tests and nothing sleeps.
 """
 from __future__ import annotations
 
-import importlib
 import ipaddress
+import itertools
 import os
-import secrets
 import socket
 import sqlite3
-import string
 import sys
-from contextlib import ExitStack
-from dataclasses import dataclass
+import tempfile
+import time as real_time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import pytest
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
-for _p in (ROOT, ROOT / "src"):
-    if _p.is_dir() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# app.main builds an application at import time and that construction touches
+# LINKS_DB_PATH; point it at a throwaway directory before importing.
+_IMPORT_DIR = tempfile.mkdtemp(prefix="links-import-")
+os.environ["LINKS_DB_PATH"] = os.path.join(_IMPORT_DIR, "import.db")
+
+import app.codes as codes_module  # noqa: E402
+import app.main as main_module  # noqa: E402
+import app.ratelimit as ratelimit_module  # noqa: E402
+from app.main import create_app  # noqa: E402
 
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
-PUBLIC_IP = "93.184.216.34"
-BASE62 = string.ascii_letters + string.digits
+DEFAULT_HOST = "203.0.113.10"
+OTHER_HOST = "198.51.100.23"
+PUBLIC_IPV4 = "93.184.216.34"
+PUBLIC_IPV6 = "2606:2800:220:1:248:1893:25c8:1946"
 
-# Exactly the names from the design's configuration list. No aliases.
-BASE_ENV: Dict[str, str] = {
-    "LINKS_BASE_URL": "http://testserver",
-    "LINKS_DEFAULT_TTL_DAYS": "30",
-    "LINKS_MAX_URL_LENGTH": "2048",
-    "LINKS_CODE_LENGTH": "7",
-    "LINKS_CODE_MAX_ATTEMPTS": "5",
-    "LINKS_RATE_LIMIT_MAX": "10",
-    "LINKS_RATE_LIMIT_WINDOW_SECONDS": "60",
-    # Most tests create many links; the design sanctions disabling the limiter
-    # through this exact flag. The rate limit tests switch it back on.
-    "LINKS_RATE_LIMIT_ENABLED": "false",
-    "LINKS_TRUST_FORWARDED_FOR": "false",
-    "LINKS_STATS_DEFAULT_LIMIT": "50",
-    "LINKS_STATS_MAX_LIMIT": "500",
-    "LINKS_DNS_RESOLUTION_ENABLED": "true",
-    "LINKS_LOG_LEVEL": "WARNING",
-}
-
-APP_MODULE_CANDIDATES = (
-    "app.main",
-    "app.app",
-    "main",
-    "app",
-    "src.main",
-    "src.app.main",
-    "api.main",
-    "server.main",
-    "service.main",
-    "shortener.main",
-    "url_shortener.main",
-    "urlshortener.main",
-    "links.main",
-    "application",
-    "server",
-)
-
-_APP_MODULE_NAME: Optional[str] = None
+LINK_COLUMNS = ["id", "code", "url", "created_at", "expires_at"]
+CLICK_COLUMNS = ["id", "link_id", "clicked_at", "referrer", "user_agent"]
 
 
-# --------------------------------------------------------------------------
-# application loading
-# --------------------------------------------------------------------------
-def _purge_root(root: str) -> None:
-    for name in list(sys.modules):
-        if name == root or name.startswith(root + "."):
-            del sys.modules[name]
+# ---------------------------------------------------------------------------
+# environment hygiene
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    """Remove every service variable so ambient configuration cannot leak in."""
+    for name in list(os.environ):
+        if name.startswith("LINKS_") or name == "SHORTENER_API_KEYS":
+            monkeypatch.delenv(name, raising=False)
 
 
-def _get_app_object(module: Any):
-    obj = getattr(module, "app", None)
-    if obj is not None and hasattr(obj, "router"):
-        return obj
-    factory = getattr(module, "create_app", None)
-    if callable(factory):
-        try:
-            built = factory()
-        except Exception:
-            return None
-        if built is not None and hasattr(built, "router"):
-            return built
-    return None
+@pytest.fixture(autouse=True)
+def _no_outbound_connections(monkeypatch):
+    def refuse(*args, **kwargs):  # pragma: no cover - only fires on a bug
+        raise AssertionError("the service must never open an outbound connection")
+
+    monkeypatch.setattr(socket, "create_connection", refuse, raising=False)
 
 
-def _import_app_module():
-    global _APP_MODULE_NAME
-    errors: List[str] = []
-    names = [_APP_MODULE_NAME] if _APP_MODULE_NAME else list(APP_MODULE_CANDIDATES)
-    for name in names:
-        _purge_root(name.split(".")[0])
-        try:
-            module = importlib.import_module(name)
-        except Exception as exc:  # pragma: no cover - depends on layout
-            errors.append("{0}: {1}: {2}".format(name, type(exc).__name__, exc))
-            continue
-        if _get_app_object(module) is None:
-            errors.append("{0}: no FastAPI `app` and no usable `create_app()`".format(name))
-            continue
-        _APP_MODULE_NAME = name
-        return module
-    raise RuntimeError(
-        "Could not import the ASGI application. Tried:\n  " + "\n  ".join(errors)
-    )
-
-
-# --------------------------------------------------------------------------
-# stub resolver: no test may hit real DNS
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# deterministic resolver
+# ---------------------------------------------------------------------------
 class FakeResolver:
+    """Stand-in for :func:`socket.getaddrinfo` with no network access."""
+
     def __init__(self) -> None:
         self.map: Dict[str, List[str]] = {}
         self.failures = set()
         self.lookups: List[str] = []
 
-    def set(self, host: str, addresses) -> None:
+    def set(self, host: str, addresses: Iterable[str]) -> None:
         self.map[host.strip("[]").lower()] = list(addresses)
 
     def fail(self, host: str) -> None:
         self.failures.add(host.strip("[]").lower())
 
     def _addresses_for(self, host: str) -> List[str]:
-        h = (host or "").strip("[]").lower()
-        self.lookups.append(h)
-        if h in self.failures:
+        name = (host or "").strip("[]").lower()
+        self.lookups.append(name)
+        if name in self.failures:
             raise socket.gaierror(-2, "Name or service not known")
-        if h in self.map:
-            return list(self.map[h])
+        if name in self.map:
+            return list(self.map[name])
         try:
-            ipaddress.ip_address(h)
-            return [h]
+            ipaddress.ip_address(name)
+            return [name]
         except ValueError:
-            return [PUBLIC_IP]
+            return [PUBLIC_IPV4]
 
     def getaddrinfo(self, host, port=0, family=0, type=0, proto=0, flags=0):
-        out = []
         try:
             portnum = int(port)
         except (TypeError, ValueError):
-            portnum = 80
-        for addr in self._addresses_for(host):
-            ip = ipaddress.ip_address(addr)
-            if ip.version == 4:
-                out.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, portnum)))
+            portnum = 0
+        out = []
+        for address in self._addresses_for(host):
+            parsed = ipaddress.ip_address(address)
+            if parsed.version == 4:
+                out.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, portnum)))
             else:
                 out.append(
-                    (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (addr, portnum, 0, 0))
+                    (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, portnum, 0, 0))
                 )
         return out
 
     def gethostbyname(self, host):
-        for addr in self._addresses_for(host):
-            if ipaddress.ip_address(addr).version == 4:
-                return addr
+        for address in self._addresses_for(host):
+            if ipaddress.ip_address(address).version == 4:
+                return address
         raise socket.gaierror(-2, "Name or service not known")
 
-    def gethostbyname_ex(self, host):
-        addrs = [a for a in self._addresses_for(host) if ipaddress.ip_address(a).version == 4]
-        return (host, [], addrs)
 
-
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def fake_dns(monkeypatch):
     resolver = FakeResolver()
     monkeypatch.setattr(socket, "getaddrinfo", resolver.getaddrinfo)
     monkeypatch.setattr(socket, "gethostbyname", resolver.gethostbyname)
-    monkeypatch.setattr(socket, "gethostbyname_ex", resolver.gethostbyname_ex)
     return resolver
 
 
-# --------------------------------------------------------------------------
-# the app under test
-# --------------------------------------------------------------------------
-@dataclass
-class AppUnderTest:
-    client: TestClient
-    db_path: str
-    module: Any
+# ---------------------------------------------------------------------------
+# limiter clock (advance the window without sleeping)
+# ---------------------------------------------------------------------------
+class FakeClock:
+    """Frozen, advanceable replacement for the limiter's time source."""
 
-    # ---- HTTP helpers ----
-    def create(self, url=None, expires_at=None, headers=None, payload=None):
+    def __init__(self, real) -> None:
+        self._real = real
+        self.value = 100000.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def time(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += float(seconds)
+
+    def __getattr__(self, name):  # pragma: no cover - delegation only
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def limiter_clock(monkeypatch):
+    clock = FakeClock(real_time)
+    monkeypatch.setattr(ratelimit_module, "time", clock, raising=False)
+    return clock
+
+
+# ---------------------------------------------------------------------------
+# scripted short codes (collision forcing)
+# ---------------------------------------------------------------------------
+_FALLBACK_COUNTER = itertools.count(1)
+
+
+def _fallback_code(length: int = 7) -> str:
+    text = "Zz{0:05d}".format(next(_FALLBACK_COUNTER))
+    if len(text) >= length:
+        return text[:length]
+    return text + "0" * (length - len(text))
+
+
+class ScriptedCodes:
+    """Deterministic short code generator used to force UNIQUE collisions."""
+
+    def __init__(self, codes: Iterable[str]) -> None:
+        self.queue = list(codes)
+        self.calls = 0
+        self.produced: List[str] = []
+
+    def __call__(self, length: int = 7, *args, **kwargs) -> str:
+        self.calls += 1
+        if self.queue:
+            value = self.queue.pop(0)
+        else:
+            value = _fallback_code(int(length or 7))
+        self.produced.append(value)
+        return value
+
+
+@pytest.fixture
+def scripted_codes(monkeypatch):
+    def install(codes: Iterable[str]) -> ScriptedCodes:
+        stub = ScriptedCodes(codes)
+        monkeypatch.setattr(main_module, "generate_code", stub, raising=False)
+        monkeypatch.setattr(codes_module, "generate_code", stub, raising=False)
+        return stub
+
+    return install
+
+
+# ---------------------------------------------------------------------------
+# the application under test
+# ---------------------------------------------------------------------------
+class Harness:
+    """HTTP + database view of one freshly built application."""
+
+    def __init__(self, application, db_path) -> None:
+        self.app = application
+        self.db_path = str(db_path)
+        self._clients: Dict[str, TestClient] = {}
+
+    # -- HTTP -------------------------------------------------------------
+    def client(self, host: str = DEFAULT_HOST) -> TestClient:
+        if host not in self._clients:
+            try:
+                client = TestClient(
+                    self.app,
+                    base_url="http://testserver",
+                    raise_server_exceptions=False,
+                    follow_redirects=False,
+                    client=(host, 45000),
+                )
+            except TypeError:  # pragma: no cover - very old TestClient
+                client = TestClient(
+                    self.app,
+                    base_url="http://testserver",
+                    raise_server_exceptions=False,
+                )
+            self._clients[host] = client
+        return self._clients[host]
+
+    @staticmethod
+    def _headers(api_key: Optional[str], headers: Optional[Dict[str, str]]):
+        merged = dict(headers or {})
+        if api_key is not None:
+            merged["X-API-Key"] = api_key
+        return merged
+
+    def create(
+        self,
+        url: Optional[str] = None,
+        *,
+        expires_at: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        host: str = DEFAULT_HOST,
+        headers: Optional[Dict[str, str]] = None,
+    ):
         if payload is None:
             payload = {}
             if url is not None:
                 payload["url"] = url
             if expires_at is not None:
                 payload["expires_at"] = expires_at
-        return self.client.post("/api/links", json=payload, headers=headers or {})
-
-    def visit(self, code, headers=None):
-        try:
-            return self.client.get(
-                "/" + str(code), headers=headers or {}, follow_redirects=False
-            )
-        except TypeError:  # pragma: no cover - very old TestClient
-            return self.client.get(
-                "/" + str(code), headers=headers or {}, allow_redirects=False
-            )
-
-    def stats(self, code, **params):
-        return self.client.get(
-            "/api/links/{0}/stats".format(code), params=params or None
+        return self.client(host).post(
+            "/api/links", json=payload, headers=self._headers(api_key, headers)
         )
 
-    # ---- database helpers ----
-    def _rows(self, sql, params=()):
+    def create_ok(self, url: str, **kwargs) -> str:
+        response = self.create(url, **kwargs)
+        assert response.status_code == 201, "create({0!r}) -> {1}: {2}".format(
+            url, response.status_code, response.text[:200]
+        )
+        return response.json()["code"]
+
+    def visit(
+        self,
+        code,
+        *,
+        api_key: Optional[str] = None,
+        host: str = DEFAULT_HOST,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        return self.client(host).get(
+            "/" + str(code), headers=self._headers(api_key, headers)
+        )
+
+    def stats(
+        self,
+        code,
+        *,
+        api_key: Optional[str] = None,
+        host: str = DEFAULT_HOST,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        return self.client(host).get(
+            "/api/links/{0}/stats".format(code),
+            params=params,
+            headers=self._headers(api_key, None),
+        )
+
+    # -- database ---------------------------------------------------------
+    def _rows(self, sql: str, params=()) -> List[Dict[str, Any]]:
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
         try:
-            return [dict(r) for r in con.execute(sql, params).fetchall()]
+            return [dict(row) for row in con.execute(sql, params).fetchall()]
         except sqlite3.OperationalError as exc:
             raise AssertionError(
                 "sqlite error {0!r} against {1}: does the service honour "
-                "LINKS_DB_PATH and create its schema at startup?".format(
-                    str(exc), self.db_path
-                )
+                "LINKS_DB_PATH and create its schema?".format(str(exc), self.db_path)
             )
         finally:
             con.close()
 
-    def link_rows(self):
+    def link_rows(self) -> List[Dict[str, Any]]:
         return self._rows("SELECT * FROM links ORDER BY id")
 
-    def click_rows(self):
+    def click_rows(self) -> List[Dict[str, Any]]:
         return self._rows("SELECT * FROM clicks ORDER BY id")
 
-    def columns(self, table):
-        return [r["name"] for r in self._rows("PRAGMA table_info({0})".format(table))]
+    def link_count(self) -> int:
+        return int(self._rows("SELECT COUNT(*) AS n FROM links")[0]["n"])
 
-    def set_expiry(self, code, when: datetime) -> None:
+    def click_count(self) -> int:
+        return int(self._rows("SELECT COUNT(*) AS n FROM clicks")[0]["n"])
+
+    def tables(self) -> List[str]:
+        return sorted(
+            row["name"]
+            for row in self._rows("SELECT name FROM sqlite_master WHERE type = 'table'")
+        )
+
+    def columns(self, table: str) -> List[str]:
+        return [row["name"] for row in self._rows("PRAGMA table_info({0})".format(table))]
+
+    def set_expiry(self, code: str, when: datetime) -> None:
         stamp = when.astimezone(timezone.utc).strftime(TS_FORMAT)
         con = sqlite3.connect(self.db_path)
         try:
-            cur = con.execute(
+            cursor = con.execute(
                 "UPDATE links SET expires_at = ? WHERE code = ?", (stamp, code)
             )
             con.commit()
-            assert cur.rowcount == 1, "no links row with code {0!r} to expire".format(code)
+            assert cursor.rowcount == 1, "no links row with code {0!r}".format(code)
         finally:
             con.close()
 
     def disk_bytes(self) -> bytes:
         blob = b""
-        base = Path(self.db_path)
-        for path in sorted(base.parent.glob("*")):
+        for path in sorted(Path(self.db_path).parent.glob("*")):
             if path.is_file():
                 blob += path.read_bytes()
         return blob
 
+    def close(self) -> None:
+        for client in self._clients.values():
+            try:
+                client.close()
+            except Exception:  # pragma: no cover - best effort
+                pass
+
 
 @pytest.fixture
 def app_factory(tmp_path, monkeypatch, fake_dns):
-    stack = ExitStack()
-    counter = {"n": 0}
+    counter = itertools.count(1)
+    built: List[Harness] = []
 
-    def factory(**overrides) -> AppUnderTest:
-        counter["n"] += 1
-        db_path = tmp_path / "links-{0}.db".format(counter["n"])
-        env = dict(BASE_ENV)
-        env["LINKS_DB_PATH"] = str(db_path)
-        env.update({k: str(v) for k, v in overrides.items()})
-        for key, value in env.items():
-            monkeypatch.setenv(key, value)
-        module = _import_app_module()
-        asgi = _get_app_object(module)
-        assert asgi is not None, "application module exposes no ASGI app"
-        try:
-            client = TestClient(
-                asgi,
-                base_url="http://testserver",
-                raise_server_exceptions=False,
-                follow_redirects=False,
-            )
-        except TypeError:  # pragma: no cover
-            client = TestClient(asgi, base_url="http://testserver")
-        stack.enter_context(client)
-        return AppUnderTest(client=client, db_path=str(db_path), module=module)
+    def factory(**env) -> Harness:
+        index = next(counter)
+        db_path = tmp_path / "app{0}".format(index) / "links.db"
+        monkeypatch.setenv("LINKS_DB_PATH", str(db_path))
+        for name, value in env.items():
+            monkeypatch.setenv(name, str(value))
+        harness = Harness(create_app(), db_path)
+        built.append(harness)
+        return harness
 
-    try:
-        yield factory
-    finally:
-        stack.close()
+    yield factory
+
+    for harness in built:
+        harness.close()
 
 
 @pytest.fixture
-def app(app_factory) -> AppUnderTest:
+def app(app_factory) -> Harness:
     return app_factory()
 
 
-# --------------------------------------------------------------------------
-# forcing short code collisions
-# --------------------------------------------------------------------------
-def _random_code(length: int = 7) -> str:
-    return "".join(secrets.choice(BASE62) for _ in range(length))
-
-
-class CodeStub:
-    """Stands in for the service's short code generator."""
-
-    mode = "named"
-
-    def __init__(self, codes, length: int = 7):
-        self.queue = list(codes)
-        self.length = length
-        self.calls = 0
-
-    def __call__(self, *args, **kwargs):
-        self.calls += 1
-        if self.queue:
-            return self.queue.pop(0)
-        return _random_code(self.length)
-
-
-class CharStub:
-    """Fallback: feed the characters of the desired codes to secrets.choice."""
-
-    mode = "secrets.choice"
-
-    def __init__(self, codes, length: int, original):
-        self.chars: List[str] = []
-        for code in codes:
-            self.chars.extend(list(code))
-        self.length = max(int(length), 1)
-        self.consumed = 0
-        self._original = original
-
-    def __call__(self, sequence):
-        if self.chars:
-            self.consumed += 1
-            return self.chars.pop(0)
-        return self._original(sequence)
-
-    @property
-    def calls(self) -> int:
-        return self.consumed // self.length
-
-
-_HINTS = ("gen", "make", "new", "random", "build", "mint", "alloc")
-_BAD = ("max", "attempt", "length", "len", "pattern", "alphabet", "chars", "error", "status")
-
-
-def _find_code_generators(module):
-    root = module.__name__.split(".")[0]
-    found = []
-    for name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        if name != root and not name.startswith(root + "."):
-            continue
-        for attr in dir(mod):
-            low = attr.lower()
-            if "code" not in low:
-                continue
-            if any(bad in low for bad in _BAD):
-                continue
-            if not any(hint in low for hint in _HINTS):
-                continue
-            value = getattr(mod, attr, None)
-            if not callable(value):
-                continue
-            owner = getattr(value, "__module__", "") or ""
-            if owner != root and not owner.startswith(root + "."):
-                continue
-            found.append((mod, attr))
-    return found
-
-
-@pytest.fixture
-def force_codes(monkeypatch):
-    """Make the next short codes produced by the service be exactly `codes`."""
-
-    def _force(app_under_test: AppUnderTest, codes):
-        length = int(os.environ.get("LINKS_CODE_LENGTH", "7"))
-        targets = _find_code_generators(app_under_test.module)
-        if targets:
-            stub = CodeStub(codes, length)
-            for mod, attr in targets:
-                monkeypatch.setattr(mod, attr, stub)
-            return stub
-        stub = CharStub(codes, length, secrets.choice)
-        monkeypatch.setattr(secrets, "choice", stub)
-        return stub
-
-    return _force
-
-
-# --------------------------------------------------------------------------
-# assorted helpers used by the tests
-# --------------------------------------------------------------------------
-def parse_ts(value: str) -> datetime:
-    assert isinstance(value, str), "timestamp must be a string, got {0!r}".format(value)
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    parsed = datetime.fromisoformat(text)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def assert_error_envelope(response) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# assertion helpers
+# ---------------------------------------------------------------------------
+def assert_error(response) -> Dict[str, Any]:
+    """Assert the stable error envelope and return the inner error object."""
     assert "application/json" in response.headers.get("content-type", ""), (
         "error responses must be JSON, got "
         + repr(response.headers.get("content-type"))
     )
     body = response.json()
     assert isinstance(body, dict) and "error" in body, (
-        "error body must be {'error': {...}}, got " + repr(body)
+        "error body must be {'error': {...}}, got " + repr(body)[:200]
     )
-    err = body["error"]
-    assert isinstance(err, dict), "error must be an object, got " + repr(err)
-    assert isinstance(err.get("code"), str) and err["code"], (
-        "error.code must be a non-empty string, got " + repr(err)
+    error = body["error"]
+    assert isinstance(error, dict), repr(error)[:200]
+    assert isinstance(error.get("code"), str) and error["code"], repr(error)[:200]
+    assert isinstance(error.get("message"), str) and error["message"], repr(error)[:200]
+    return error
+
+
+def assert_retry_after(response, window: int = 60) -> int:
+    value = response.headers.get("retry-after")
+    assert value is not None, "a 429 must carry Retry-After"
+    assert value.isdigit(), "Retry-After must be whole seconds, got " + repr(value)
+    seconds = int(value)
+    assert 1 <= seconds <= window, "Retry-After out of range: " + repr(value)
+    assert "no-store" in response.headers.get("cache-control", "").lower(), (
+        "a 429 must not be cached; Cache-Control was "
+        + repr(response.headers.get("cache-control"))
     )
-    assert isinstance(err.get("message"), str) and err["message"], (
-        "error.message must be a non-empty string, got " + repr(err)
-    )
-    return err
+    return seconds
+
+
+def parse_ts(value: str) -> datetime:
+    assert isinstance(value, str), "timestamp must be a string, got " + repr(value)
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
