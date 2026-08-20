@@ -34,6 +34,11 @@ That found a bad test of mine. My first regression test for the concurrent-rollb
 
 **Stage prompts are tested structurally, not for output quality.** The tests check that schemas are strict, that templates render, and that required variables exist. Whether a prompt elicits good code is answered by running it, and that evidence lives in `runs/` rather than in the suite.
 
+**Replay cannot exercise the repair loop.** Repair regenerates the
+implementation from the failing transcript, and a recording has no new code to
+give it. A replayed run that reaches a genuine test failure therefore stops
+where a live one would have recovered.
+
 **Replay determinism is not asserted end to end.** Individual cassette lookups are tested, but there is no test that a full replayed run reproduces its recorded run byte for byte.
 
 **One process, one machine.** Concurrency is asyncio within a single process. The scoped-rollback bug is a preview of what distributing stages across hosts would surface, and none of that is covered.

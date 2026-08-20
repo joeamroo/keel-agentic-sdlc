@@ -69,8 +69,15 @@ Being precise about this, because the difference matters to anyone evaluating th
 | --- | --- | --- |
 | greenfield | all seven nodes, verification passed | yes, end to end |
 | ambiguous (park) | intake refusing to plan | yes |
-| ambiguous (resumed) | all seven nodes after the questions were answered | yes, end to end |
+| ambiguous (resumed) | all seven nodes after the questions were answered | up to verification |
 | brownfield | impact analysis, design, approval, implementation, test authoring | no, see below |
+
+The resumed run completed live. Its replay stops at verification with 89 of 91
+generated tests passing, because replay cannot regenerate code: the recorded
+implementation and the recorded test suite are each real, and where they
+disagree the repair loop has nothing to work with. That limitation is worth
+knowing about the technique generally. **Replay proves the orchestration, not
+the model's ability to converge.**
 
 **The brownfield recording is kept for what it caught, not as a passing run.**
 It contains the part unique to that scenario: reasoning over the existing
