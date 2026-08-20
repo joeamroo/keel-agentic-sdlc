@@ -1,341 +1,286 @@
-"""Destination URL validation.
+"""Validation of user-supplied target URLs.
 
-Only ``http`` and ``https`` URLs are accepted (allow-list, not a block-list of
-bad schemes). Hosts are resolved and every resulting address is checked against
-the denied ranges: loopback, private, link-local (including the cloud metadata
-address 169.254.169.254), unique-local, CGNAT, multicast, unspecified and
-other reserved space. No HTTP request is ever made to a user supplied URL.
+Only ``http`` and ``https`` URLs are accepted (allow-list, not a block-list).
+Embedded credentials are rejected, the host is resolved and every resolved
+address must be a globally routable unicast address: loopback, private, link
+local, multicast, reserved and unspecified addresses are refused, with
+169.254.169.254 (the cloud metadata endpoint) denied explicitly.
+
+The value returned by :func:`validate_target_url` is the value the caller must
+store, so nothing that skipped validation can ever be served on a redirect.
 """
 
 from __future__ import annotations
 
 import ipaddress
-import logging
 import socket
-from typing import List, Optional, Tuple, Union
-from urllib.parse import urlsplit
-
-from .errors import ApiError
-
-logger = logging.getLogger("links.validation")
-
-IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
-IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+import threading
+import time
+from collections import OrderedDict
+from typing import Dict, Tuple, Union
+from urllib.parse import urlsplit, urlunsplit
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 MAX_HOST_LENGTH = 253
+DNS_CACHE_TTL_SECONDS = 60.0
+DNS_CACHE_MAX_ENTRIES = 512
 
-BLOCKED_MESSAGE = (
-    "The destination host is not a permitted public address."
-)
-
-#: Explicitly denied singleton addresses. 169.254.169.254 is the cloud
-#: metadata endpoint; reaching it turns a URL fetcher into a credential leak.
-CLOUD_METADATA_ADDRESSES = frozenset(
+#: Cloud metadata endpoints denied by explicit literal as well as by range.
+METADATA_ADDRESSES = frozenset(
     {
         ipaddress.ip_address("169.254.169.254"),
         ipaddress.ip_address("fd00:ec2::254"),
     }
 )
 
-BLOCKED_NETWORKS: Tuple[IPNetwork, ...] = (
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.0.0.0/24"),
-    ipaddress.ip_network("192.0.2.0/24"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("198.18.0.0/15"),
-    ipaddress.ip_network("198.51.100.0/24"),
-    ipaddress.ip_network("203.0.113.0/24"),
-    ipaddress.ip_network("224.0.0.0/4"),
-    ipaddress.ip_network("240.0.0.0/4"),
-    ipaddress.ip_network("255.255.255.255/32"),
-    ipaddress.ip_network("::/128"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("64:ff9b:1::/48"),
-    ipaddress.ip_network("100::/64"),
-    ipaddress.ip_network("2001:db8::/32"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-    ipaddress.ip_network("ff00::/8"),
-)
+IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+_dns_cache: "OrderedDict[str, Tuple[float, Tuple[str, ...]]]" = OrderedDict()
+_dns_lock = threading.Lock()
 
 
-def _parse_int_token(token: str) -> Optional[int]:
-    """Parse one dotted-quad component allowing decimal, octal and hex forms.
+class UrlValidationError(ValueError):
+    """Raised when a submitted target URL is not acceptable for storage."""
 
-    ``token`` is a single component such as ``0x7f``, ``0177`` or ``127``.
-    Returns the integer value, or ``None`` when the token is not a valid
-    numeric component. Raises nothing.
+
+def _has_forbidden_characters(value: str) -> bool:
+    """Report whether a URL string contains whitespace or control characters.
+
+    Args:
+        value: The candidate URL.
+
+    Returns:
+        ``True`` when the value contains any whitespace, C0 control character or
+        DEL, which would allow header or request splitting downstream.
+
+    Raises:
+        Nothing.
     """
-    if not token:
-        return None
-    lowered = token.lower()
-    try:
-        if lowered.startswith("0x"):
-            digits = lowered[2:]
-            if not digits or any(c not in "0123456789abcdef" for c in digits):
-                return None
-            value = int(digits, 16)
-        elif len(lowered) > 1 and lowered.startswith("0"):
-            digits = lowered[1:]
-            if any(c not in "01234567" for c in digits):
-                return None
-            value = int(digits, 8)
-        else:
-            if not lowered.isdigit():
-                return None
-            value = int(lowered, 10)
-    except ValueError:
-        return None
-    if value < 0 or value > 0xFFFFFFFF:
-        return None
-    return value
-
-
-def parse_relaxed_ipv4(host: str) -> Optional[ipaddress.IPv4Address]:
-    """Decode non canonical IPv4 literals (decimal, octal, hex, short forms).
-
-    ``host`` is the host component of a URL. Returns the decoded
-    :class:`ipaddress.IPv4Address` when the host is any ``inet_aton`` style
-    literal such as ``2130706433``, ``0x7f.0.0.1`` or ``127.1``; returns
-    ``None`` when the host is not such a literal. Raises nothing.
-    """
-    candidate = host.rstrip(".")
-    if not candidate:
-        return None
-    parts = candidate.split(".")
-    if len(parts) > 4:
-        return None
-    values: List[int] = []
-    for part in parts:
-        parsed = _parse_int_token(part)
-        if parsed is None:
-            return None
-        values.append(parsed)
-    for value in values[:-1]:
-        if value > 0xFF:
-            return None
-    remaining_bytes = 4 - (len(values) - 1)
-    last = values[-1]
-    if last > (256 ** remaining_bytes) - 1:
-        return None
-    total = 0
-    for index, value in enumerate(values[:-1]):
-        total |= value << (8 * (3 - index))
-    total |= last
-    try:
-        return ipaddress.IPv4Address(total)
-    except (ipaddress.AddressValueError, ValueError):
-        return None
-
-
-def parse_host_as_ip(host: str) -> Optional[IPAddress]:
-    """Interpret a URL host as an IP literal if possible.
-
-    ``host`` is the (already bracket stripped) host component. Returns the
-    parsed address for canonical IPv4/IPv6 literals and for relaxed IPv4
-    literals, or ``None`` when the host is a name. Raises nothing.
-    """
-    cleaned = host.strip().strip("[]")
-    if not cleaned:
-        return None
-    if "%" in cleaned:
-        cleaned = cleaned.split("%", 1)[0]
-    try:
-        return ipaddress.ip_address(cleaned)
-    except ValueError:
-        pass
-    return parse_relaxed_ipv4(cleaned)
-
-
-def _embedded_addresses(ip: IPAddress) -> List[IPAddress]:
-    """Extract IPv4 addresses embedded inside an IPv6 address.
-
-    ``ip`` is any parsed address. Returns a list of embedded IPv4 addresses for
-    IPv4-mapped, IPv4-compatible, 6to4 and Teredo forms; an empty list when
-    nothing is embedded. Raises nothing.
-    """
-    if not isinstance(ip, ipaddress.IPv6Address):
-        return []
-    embedded: List[IPAddress] = []
-    if ip.ipv4_mapped is not None:
-        embedded.append(ip.ipv4_mapped)
-    if ip.sixtofour is not None:
-        embedded.append(ip.sixtofour)
-    teredo = ip.teredo
-    if teredo is not None:
-        embedded.extend([teredo[0], teredo[1]])
-    packed = ip.packed
-    if packed[:12] == b"\x00" * 12 and int(ip) > 1:
-        embedded.append(ipaddress.IPv4Address(packed[12:]))
-    return embedded
-
-
-def _single_address_blocked(ip: IPAddress) -> bool:
-    """Test one address (without unwrapping) against the denied ranges.
-
-    ``ip`` is a parsed address. Returns ``True`` when the address is denied.
-    Raises nothing.
-    """
-    if ip in CLOUD_METADATA_ADDRESSES:
-        return True
-    if (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_unspecified
-        or ip.is_reserved
-    ):
-        return True
-    if not ip.is_global:
-        return True
-    for network in BLOCKED_NETWORKS:
-        if ip.version == network.version and ip in network:
-            return True
-    return False
-
-
-def is_blocked_address(ip: IPAddress) -> bool:
-    """Test an address, including any embedded IPv4 form, against the denylist.
-
-    ``ip`` is a parsed address. Returns ``True`` when the address itself or any
-    address embedded within it is loopback, private, link-local, unique-local,
-    CGNAT, multicast, unspecified or otherwise reserved. Raises nothing.
-    """
-    if _single_address_blocked(ip):
-        return True
-    for embedded in _embedded_addresses(ip):
-        if _single_address_blocked(embedded):
-            return True
-    return False
-
-
-def resolve_host(host: str) -> List[str]:
-    """Resolve a hostname to textual addresses using the stdlib resolver.
-
-    ``host`` is a DNS name. Returns the list of address strings returned by
-    :func:`socket.getaddrinfo` for ``AF_UNSPEC``; returns an empty list when
-    resolution fails so callers can fail closed. Raises nothing.
-    """
-    try:
-        infos = socket.getaddrinfo(
-            host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
-        )
-    except (socket.gaierror, UnicodeError, OSError, ValueError):
-        return []
-    addresses: List[str] = []
-    for info in infos:
-        address: Optional[str] = None
-        if isinstance(info, str):
-            address = info
-        else:
-            try:
-                sockaddr = info[4]
-            except (IndexError, TypeError, KeyError):
-                sockaddr = None
-            if isinstance(sockaddr, (tuple, list)) and sockaddr:
-                candidate = sockaddr[0]
-                if isinstance(candidate, bytes):
-                    candidate = candidate.decode("ascii", "ignore")
-                if isinstance(candidate, str):
-                    address = candidate
-            elif isinstance(sockaddr, str):
-                address = sockaddr
-        if not address:
-            continue
-        addresses.append(address.split("%", 1)[0])
-    return addresses
-
-
-def _has_forbidden_characters(url: str) -> bool:
-    """Detect control characters or whitespace inside a URL.
-
-    ``url`` is the raw client string. Returns ``True`` when the URL contains
-    whitespace, C0 controls or DEL, which would allow header injection when the
-    value is later emitted in a ``Location`` header. Raises nothing.
-    """
-    for char in url:
+    for char in value:
         if char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F:
             return True
     return False
 
 
-def validate_destination_url(url: str, *, dns_enabled: bool) -> str:
-    """Validate a caller supplied destination URL before it is stored.
+def _normalise_host(host: str) -> str:
+    """Normalise a URL host to a lowercase ASCII form.
 
-    ``url`` is the raw string from the request body and ``dns_enabled`` selects
-    whether hostnames are resolved and every resulting address denylist checked.
-    Returns the URL unchanged (the exact value that will be stored and later
-    served). Raises :class:`app.errors.ApiError` with code ``unsupported_scheme``
-    for any scheme other than http/https, ``invalid_url`` for a structurally
-    unusable URL or embedded credentials, and ``blocked_destination`` when the
-    host is or resolves to a non public address (including unresolvable hosts,
-    which fail closed).
+    Args:
+        host: The host component taken from the parsed URL.
+
+    Returns:
+        The lowercase host, IDNA-encoded when it contains non-ASCII characters.
+
+    Raises:
+        UrlValidationError: If the host is empty or is not encodable as a
+            domain name.
     """
-    if _has_forbidden_characters(url):
-        raise ApiError(400, "invalid_url", "The url contains invalid characters.")
+    candidate = host.strip().rstrip(".").lower()
+    if not candidate:
+        raise UrlValidationError("The target URL must include a host.")
+    if candidate.isascii():
+        return candidate
+    try:
+        return candidate.encode("idna").decode("ascii")
+    except (UnicodeError, UnicodeDecodeError) as exc:  # pragma: no cover - rare
+        raise UrlValidationError(
+            "The target URL host is not a valid domain name."
+        ) from exc
+
+
+def resolve_host(host: str) -> Tuple[str, ...]:
+    """Resolve a host to the set of IP addresses it points at.
+
+    Literal IP addresses are returned unchanged.  Successful DNS results are
+    cached in-process for ``DNS_CACHE_TTL_SECONDS`` so a burst of creations does
+    not hammer the resolver.
+
+    Args:
+        host: An ASCII host name or IP literal.
+
+    Returns:
+        A tuple of IP address strings (at least one entry).
+
+    Raises:
+        UrlValidationError: If the host cannot be resolved.
+    """
+    try:
+        ipaddress.ip_address(host)
+        return (host,)
+    except ValueError:
+        pass
+
+    now = time.monotonic()
+    with _dns_lock:
+        cached = _dns_cache.get(host)
+        if cached is not None and cached[0] > now:
+            _dns_cache.move_to_end(host)
+            return cached[1]
 
     try:
-        parts = urlsplit(url)
-    except ValueError:
-        raise ApiError(400, "invalid_url", "The url could not be parsed.")
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError, OSError) as exc:
+        raise UrlValidationError(
+            "The target URL host could not be resolved."
+        ) from exc
 
-    scheme = (parts.scheme or "").lower()
-    if scheme not in ALLOWED_SCHEMES:
-        raise ApiError(
-            400,
-            "unsupported_scheme",
-            "Only http and https URLs are supported.",
-        )
-
-    if parts.username is not None or parts.password is not None:
-        raise ApiError(
-            400,
-            "invalid_url",
-            "Embedded credentials are not allowed in the url.",
-        )
-
-    try:
-        port = parts.port
-    except ValueError:
-        raise ApiError(400, "invalid_url", "The url contains an invalid port.")
-    if port is not None and (port < 1 or port > 65535):
-        raise ApiError(400, "invalid_url", "The url contains an invalid port.")
-
-    host = parts.hostname
-    if not host:
-        raise ApiError(400, "invalid_url", "The url must include a host.")
-    if len(host) > MAX_HOST_LENGTH:
-        raise ApiError(400, "invalid_url", "The url host is too long.")
-
-    literal = parse_host_as_ip(host)
-    if literal is not None:
-        if is_blocked_address(literal):
-            raise ApiError(400, "blocked_destination", BLOCKED_MESSAGE)
-        return url
-
-    if not dns_enabled:
-        return url
-
-    addresses = resolve_host(host)
+    addresses = tuple(sorted({str(info[4][0]).split("%")[0] for info in infos}))
     if not addresses:
-        raise ApiError(
-            400,
-            "blocked_destination",
-            "The destination host could not be resolved.",
+        raise UrlValidationError("The target URL host could not be resolved.")
+
+    with _dns_lock:
+        _dns_cache[host] = (now + DNS_CACHE_TTL_SECONDS, addresses)
+        _dns_cache.move_to_end(host)
+        while len(_dns_cache) > DNS_CACHE_MAX_ENTRIES:
+            _dns_cache.popitem(last=False)
+    return addresses
+
+
+def clear_dns_cache() -> None:
+    """Empty the in-process DNS result cache.
+
+    Returns:
+        None.
+
+    Raises:
+        Nothing.
+    """
+    with _dns_lock:
+        _dns_cache.clear()
+
+
+def _assert_address_allowed(address: IPAddress) -> None:
+    """Reject any address that is not a globally routable unicast address.
+
+    Args:
+        address: The resolved IP address to inspect.
+
+    Returns:
+        None.
+
+    Raises:
+        UrlValidationError: If the address is the cloud metadata endpoint, or is
+            loopback, private, link local, multicast, reserved, unspecified or
+            otherwise not globally routable.
+    """
+    if address in METADATA_ADDRESSES:
+        raise UrlValidationError(
+            "The target URL resolves to a blocked internal address."
         )
-    for text in addresses:
+    effective: IPAddress = address
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            effective = mapped
+        elif address.sixtofour is not None:
+            effective = address.sixtofour
+    if effective in METADATA_ADDRESSES:
+        raise UrlValidationError(
+            "The target URL resolves to a blocked internal address."
+        )
+    if (
+        effective.is_loopback
+        or effective.is_private
+        or effective.is_link_local
+        or effective.is_multicast
+        or effective.is_reserved
+        or effective.is_unspecified
+        or not effective.is_global
+    ):
+        raise UrlValidationError(
+            "The target URL resolves to a blocked internal address."
+        )
+
+
+def validate_target_url(raw_url: str, max_length: int) -> str:
+    """Validate and normalise a user supplied target URL for storage.
+
+    Args:
+        raw_url: The URL exactly as submitted by the client.
+        max_length: Maximum accepted length of the URL.
+
+    Returns:
+        The normalised URL string that must be persisted and later served.
+
+    Raises:
+        UrlValidationError: If the URL is empty, too long, contains whitespace
+            or control characters, uses a scheme other than http/https, embeds
+            credentials, has no or an invalid host/port, cannot be resolved, or
+            resolves to a non-public address.
+    """
+    candidate = raw_url.strip()
+    if not candidate:
+        raise UrlValidationError("The target URL must not be empty.")
+    if len(candidate) > max_length:
+        raise UrlValidationError(
+            "The target URL is longer than the configured maximum."
+        )
+    if _has_forbidden_characters(candidate):
+        raise UrlValidationError(
+            "The target URL must not contain whitespace or control characters."
+        )
+
+    try:
+        split = urlsplit(candidate)
+    except ValueError as exc:
+        raise UrlValidationError("The target URL could not be parsed.") from exc
+
+    scheme = split.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise UrlValidationError("Only http and https target URLs are allowed.")
+    if not split.netloc:
+        raise UrlValidationError("The target URL must include a host.")
+    if "@" in split.netloc:
+        raise UrlValidationError(
+            "The target URL must not contain embedded credentials."
+        )
+
+    try:
+        host = split.hostname
+        port = split.port
+    except ValueError as exc:
+        raise UrlValidationError("The target URL has an invalid port.") from exc
+
+    if not host:
+        raise UrlValidationError("The target URL must include a host.")
+    if len(host) > MAX_HOST_LENGTH:
+        raise UrlValidationError("The target URL host is too long.")
+    if port is not None and not 1 <= port <= 65535:
+        raise UrlValidationError("The target URL has an invalid port.")
+
+    ascii_host = _normalise_host(host)
+    for address_text in resolve_host(ascii_host):
         try:
-            resolved = ipaddress.ip_address(text)
-        except ValueError:
-            # Fail closed: an address we cannot parse cannot be cleared.
-            raise ApiError(400, "blocked_destination", BLOCKED_MESSAGE)
-        if is_blocked_address(resolved):
-            raise ApiError(400, "blocked_destination", BLOCKED_MESSAGE)
-    return url
+            address = ipaddress.ip_address(address_text)
+        except ValueError as exc:  # pragma: no cover - resolver contract
+            raise UrlValidationError(
+                "The target URL host could not be resolved."
+            ) from exc
+        _assert_address_allowed(address)
+
+    netloc = "[" + ascii_host + "]" if ":" in ascii_host else ascii_host
+    if port is not None:
+        netloc = netloc + ":" + str(port)
+    path = split.path or "/"
+    normalised = urlunsplit((scheme, netloc, path, split.query, split.fragment))
+    if len(normalised) > max_length:
+        raise UrlValidationError(
+            "The target URL is longer than the configured maximum."
+        )
+    return normalised
+
+
+def dns_cache_size() -> int:
+    """Return the number of cached DNS entries.
+
+    Returns:
+        The current number of hosts held in the in-process DNS cache.
+
+    Raises:
+        Nothing.
+    """
+    with _dns_lock:
+        return len(_dns_cache)
+
+
+_UNUSED: Dict[str, str] = {}

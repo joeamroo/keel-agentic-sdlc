@@ -1,130 +1,215 @@
 # URL Shortener
 
-A small FastAPI + SQLite URL shortener: create short links, follow them, read click
-statistics. Link creation is rate limited; every other endpoint is not.
+Public JSON API that turns a caller supplied public http(s) URL into an unguessable base62 short code, redirects visitors until the link expires and exposes per-link click analytics that contain no visitor IP addresses.
 
-## Endpoints
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Liveness probe. Touches no user data and no database. |
-| `POST` | `/api/links` | Create a short link. Rate limited (see below). |
-| `GET` | `/api/links/{code}/stats` | Click statistics for a code, including `expired`. |
-| `GET` | `/{code}` | 307 redirect to the stored target URL (not listed in OpenAPI). |
-
-### Create a link
-
-```
-POST /api/links
-Content-Type: application/json
-
-{"url": "https://example.com/a/very/long/path", "expires_in_seconds": 3600}
-```
-
-`expires_in_seconds` is optional (omit it for a link that never expires) and `code`
-is an optional custom short code (`[A-Za-z0-9_-]{3,32}`). The response is `201`:
-
-```json
-{
-  "code": "aB3dE7f",
-  "short_url": "http://localhost:8000/aB3dE7f",
-  "target_url": "https://example.com/a/very/long/path",
-  "created_at": "2024-01-01T00:00:00.000000Z",
-  "expires_at": "2024-01-01T01:00:00.000000Z"
-}
-```
-
-### Expired links
-
-Expiry is enforced on the read path. `GET /{code}` for an expired code returns the
-exact same `404` body and headers as a code that never existed, so the redirect
-endpoint cannot be used as an enumeration oracle. Only
-`GET /api/links/{code}/stats` reveals expiry, via `200` with `"expired": true`.
-
-### Errors
-
-Every error uses one envelope and never contains a stack trace, a database message
-or a filesystem path:
-
-```json
-{"error": {"code": "not_found", "message": "No such link."}}
-```
-
-## Configuration
-
-All configuration comes from environment variables.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `LINKS_DB_PATH` | `./links.db` | Filesystem path to the SQLite database file (WAL mode). This is the single canonical name; `DATABASE_PATH` is never read. |
-| `LINKS_BASE_URL` | `http://localhost:8000` | Origin used to build the absolute `short_url` in the create response. Trailing slashes are stripped. |
-| `LINKS_RATE_LIMIT_ENABLED` | `true` | Master switch for all limiting. When false there is no per-IP bucket, no per-key bucket, no `429`, and `SHORTENER_API_KEYS` has no effect. |
-| `LINKS_RATE_LIMIT_MAX` | `10` | Maximum `POST /api/links` requests per window for the per-IP bucket. Applies only to callers without a recognised API key. |
-| `LINKS_RATE_LIMIT_WINDOW_SECONDS` | `60` | Fixed-window length in seconds, shared by the per-IP bucket and every per-key bucket. Also the upper clamp for `Retry-After`. |
-| `LINKS_TRUST_FORWARDED_FOR` | `false` | When true the per-IP identity is the leftmost `X-Forwarded-For` entry, otherwise the transport peer address. No influence on keyed callers. |
-| `SHORTENER_API_KEYS` | `""` (empty) | Comma-separated `key:quota` pairs, e.g. `alpha:100,beta:20`, giving per-window `POST /api/links` quotas. Read once at startup. Unset or empty means no key is ever recognised. |
-
-### Secrets
-
-This service **does** read one secret from the environment: `SHORTENER_API_KEYS`
-contains API key material. (An earlier revision of this README claimed the service
-reads no secrets; that is no longer true.) Handling rules, enforced in code:
-
-* API keys are never written to SQLite, never logged, never placed in an exception
-  message and never echoed in a response body \* Limiter state is keyed by
-  `blake2b(key, key=BOOT_SALT)` where `BOOT_SALT` is 32 random bytes generated once
-  per process, so no plaintext key sits in an in-memory map.
-* Recognition is a constant-work hash plus a dict lookup, confirmed with
-  `hmac.compare_digest`; there is no early-exit comparison loop over configured keys.
-* No key material is accepted at runtime through any admin route \enforced entirely
-  from the process environment.
-
-## Rate limiting
-
-Limiting runs as pure ASGI middleware in front of routing and body parsing, scoped
-to exactly `POST /api/links`, so a throttled request never opens a database
-connection and never writes a row. `/health`, `/{code}` and the stats endpoint are
-never refused with `429`.
-
-* **Recognised `X-API-Key`** (byte-exact, case-sensitive match against a configured
-  key, surrounding whitespace stripped): only that key's bucket is consulted, using
-  its configured quota. The per-IP bucket is neither read nor written, and the key's
-  counter is shared across every client address.
-* **No key, empty/whitespace-only key, or unknown key**: the existing per-IP bucket
-  and `LINKS_RATE_LIMIT_MAX` apply, exactly as before. Unknown keys allocate no
-  per-key bucket, so random header values cannot grow memory or buy extra allowance.
-
-Refusals return `429` with `{"error": {"code": "rate_limited", ...}}`, an integer
-`Retry-After` header (at least 1, at most the window length) and `Cache-Control:
-no-store`.
-
-Malformed entries in `SHORTENER_API_KEYS` (`alpha` with no colon, `beta:abc`,
-`gamma:0`, `gamma:-5`, `:5`, empty segments) are ignored at startup; well formed
-entries in the same string still take effect. Whitespace around keys, quotas and
-separators is stripped. If a key appears twice, the last occurrence wins.
-
-Limiter state is in-process and lost on restart.
-
-## URL safety
-
-Target URLs are validated before they are stored, and the stored value is what is
-later served in `Location`:
-
-* `http` and `https` only \* every other scheme (`javascript:`, `data:`, `file:`, ...)
-  is rejected by allow-list, not by blocking known bad names.
-* Embedded credentials (`https://user:pass@host/`) are rejected.
-* The host is resolved and every resulting address is rejected if it is loopback,
-  private, link-local, multicast, reserved or unspecified. `169.254.169.254` (the
-  cloud metadata endpoint) is denied explicitly.
-* Hosts that do not resolve are rejected.
-* Maximum length 2048 characters; control characters and whitespace are rejected.
-
-Redirect destinations only ever come from the validated, stored row \* never from a
-query parameter, header or path segment of the incoming request.
-
-## Running
+## Quickstart
 
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+Create a short link:
+
+```bash
+curl -X POST http://localhost:8000/api/links \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/page?a=1"}'
+```
+
+Response:
+
+```json
+{
+  "code": "Abc1De2",
+  "short_url": "http://localhost:8000/Abc1De2",
+  "url": "https://example.com/page?a=1",
+  "created_at": "2024-01-31T12:00:00.000000Z",
+  "expires_at": "2024-02-29T12:00:00.000000Z"
+}
+```
+
+Follow the short link:
+
+```bash
+curl -L http://localhost:8000/Abc1De2
+```
+
+Response: HTTP 307 redirect with Location header set to the stored destination.
+
+## Endpoints
+
+### POST /api/links
+
+Create a short link.
+
+Request body:
+
+```json
+{
+  "url": "https://example.com/page",
+  "expires_at": "2024-12-31T23:59:59Z"
+}
+```
+
+Fields:
+- `url` (required, string): public http(s) destination URL. Max length determined by LINKS_MAX_URL_LENGTH. No credentials are allowed in the URL.
+- `expires_at` (optional, string): RFC3339 timestamp in the future. If omitted, LINKS_DEFAULT_TTL_DAYS is added to creation time.
+
+Response (201 Created):
+
+```json
+{
+  "code": "Abc1De2",
+  "short_url": "http://localhost:8000/Abc1De2",
+  "url": "https://example.com/page",
+  "created_at": "2024-01-31T12:00:00.000000Z",
+  "expires_at": "2024-12-31T23:59:59.000000Z"
+}
+```
+
+Status codes:
+- 201: Link created.
+- 400: unsupported_scheme when scheme is not http or https; invalid_url when URL is malformed, too long, or contains invalid characters; blocked_destination when host is private, loopback, link-local, or unresolvable; invalid_expiry when expires_at is not a valid RFC3339 timestamp or is in the past.
+- 422: validation_error when url is missing, empty, not a string, or exceeds ABSOLUTE_MAX_URL_LENGTH; when expires_at is not a string or exceeds MAX_EXPIRES_AT_LENGTH.
+- 429: rate_limited when caller has exceeded the per-minute quota (see rate limiting section).
+- 503: code_generation_failed when no unique short code could be generated after LINKS_CODE_MAX_ATTEMPTS attempts.
+
+Error response format:
+
+```json
+{
+  "error": {
+    "code": "invalid_url",
+    "message": "The url must include a host."
+  }
+}
+```
+
+### GET /api/links/{code}/stats
+
+Return per-link click analytics.
+
+Path parameters:
+- `code`: the short code returned at creation.
+
+Query parameters:
+- `limit` (optional, integer): number of clicks per page. Defaults to LINKS_STATS_DEFAULT_LIMIT. Must be between 1 and LINKS_STATS_MAX_LIMIT inclusive.
+- `offset` (optional, integer): number of clicks to skip. Defaults to 0. Must be >= 0.
+
+Response (200 OK):
+
+```json
+{
+  "code": "Abc1De2",
+  "url": "https://example.com/page",
+  "created_at": "2024-01-31T12:00:00.000000Z",
+  "expires_at": "2024-12-31T23:59:59.000000Z",
+  "total_clicks": 42,
+  "clicks": [
+    {
+      "timestamp": "2024-02-01T12:15:30.123456Z",
+      "referrer": "https://news.example.com/",
+      "user_agent": "Mozilla/5.0"
+    }
+  ]
+}
+```
+
+Status codes:
+- 200: Stats retrieved. Returns data for expired links as well.
+- 404: not_found when the code does not exist.
+- 422: validation_error when limit is out of range or offset is negative.
+
+### GET /health
+
+Liveness probe. Returns 200 with status ok when the database answers a SELECT 1 query, otherwise 503 with status degraded.
+
+Response (200 OK):
+
+```json
+{
+  "status": "ok"
+}
+```
+
+Response (503 Service Unavailable):
+
+```json
+{
+  "status": "degraded"
+}
+```
+
+### GET /{code}
+
+Redirect to the stored destination.
+
+Path parameters:
+- `code`: the short code returned at creation.
+
+Response (307 Temporary Redirect):
+- Location header contains the stored destination URL.
+- Cache-Control: no-store
+- Referrer-Policy: no-referrer
+- Records a click if the link exists and has not expired.
+
+Status codes:
+- 307: Link exists and has not expired. Redirect succeeds and click is recorded.
+- 404: not_found when the code does not exist or is malformed (wrong length or character set).
+- 410: link_expired when the link exists but expires_at is in the past.
+
+## Configuration
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| LINKS_DB_PATH | ./links.db | Filesystem path to the SQLite database file. Parent directory is created if missing. |
+| LINKS_BASE_URL | http://localhost:8000 | Origin used in the short_url field of POST /api/links and GET /api/links/{code}/stats responses. Trailing slashes are stripped. |
+| LINKS_DEFAULT_TTL_DAYS | 30 | Default link lifetime in days when expires_at is omitted. Applied at creation time. |
+| LINKS_MAX_URL_LENGTH | 2048 | Maximum accepted length in characters of the target URL in request bodies. Absolute hard limit is 8192. |
+| LINKS_CODE_LENGTH | 7 | Number of base62 characters in a generated short code. Must be between 4 and 32. |
+| LINKS_CODE_MAX_ATTEMPTS | 5 | Bounded number of insert attempts when a generated code collides with the UNIQUE constraint before returning 503 code_generation_failed. Must be between 1 and 100. |
+| LINKS_RATE_LIMIT_ENABLED | true | Set to false, 0 or no (case-insensitive) to disable both per-IP and per-key rate limiting. When disabled, no rate limit state is created. |
+| LINKS_RATE_LIMIT_MAX | 10 | Per-IP request allowance for POST /api/links inside LINKS_RATE_LIMIT_WINDOW_SECONDS. Also applied to redirects multiplied by REDIRECT_LIMIT_MULTIPLIER (100). Unkeyed, blank-keyed and unknown-keyed creation requests use this budget. Must be between 1 and 1000000. |
+| LINKS_RATE_LIMIT_WINDOW_SECONDS | 60 | Width in seconds of the per-IP sliding window for POST /api/links and GET /{code}. Per-API-key window is always fixed at 60 seconds. Must be between 1 and 86400. |
+| LINKS_TRUST_FORWARDED_FOR | false | Set to true, 1 or yes (case-insensitive) to use the first X-Forwarded-For header entry as the client address for rate limiting. Otherwise the peer address is used. |
+| LINKS_STATS_DEFAULT_LIMIT | 50 | Default value for the limit query parameter of GET /api/links/{code}/stats when omitted. Must be between 1 and 10000. |
+| LINKS_STATS_MAX_LIMIT | 500 | Maximum accepted value for the limit query parameter of GET /api/links/{code}/stats. Must be between 1 and 10000. |
+| LINKS_DNS_RESOLUTION_ENABLED | true | When true, destination hostnames are resolved and every resulting address is checked against the denylist. When false, only literal IP addresses in the URL are checked. |
+| LINKS_LOG_LEVEL | INFO | Root log level. Accepted values: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET. |
+| SHORTENER_API_KEYS | (empty string) | Comma-separated NAME:QUOTA pairs declaring recognised API keys and their per-minute POST /api/links quota. Example: "alpha:100,beta:20". Each entry is parsed as: split on comma, strip whitespace around the name and quota, accept only entries with exactly one colon separator, non-empty name after stripping, and quota that parses as an integer >= 1. Entries that do not meet these criteria are silently skipped without raising. On duplicate names the last declaration wins. Parsed once at process configuration time into an immutable mapping. Unknown keys, blank keys and keys that do not match any entry byte-exactly behave identically to omitting the header. |
+
+## Rate Limiting
+
+Rate limiting applies in-process on POST /api/links and GET /{code} when LINKS_RATE_LIMIT_ENABLED is true. No rate limit state is persisted; all buckets are lost on restart.
+
+When a recognised API key is presented via the X-API-Key header on POST /api/links, the request is throttled against that key's per-minute quota declared in SHORTENER_API_KEYS instead of the per-IP budget. Unknown keys, blank keys and unrecognised keys fall through to the per-IP limiter. The key bucket uses a fixed 60 second window independent of LINKS_RATE_LIMIT_WINDOW_SECONDS.
+
+Per-IP creation requests use LINKS_RATE_LIMIT_MAX requests per LINKS_RATE_LIMIT_WINDOW_SECONDS. Redirects (GET /{code}) use LINKS_RATE_LIMIT_MAX times REDIRECT_LIMIT_MULTIPLIER (100) per LINKS_RATE_LIMIT_WINDOW_SECONDS.
+
+When a request is throttled, the response is 429 rate_limited with a Retry-After header indicating the minimum seconds to wait before the next request is accepted.
+
+Client identification uses a per-boot salted SHA-256 hash of the client address. The raw address is never stored, logged or persisted to disk. Rate limit state exists only in process memory.
+
+## Security Posture
+
+Destination URLs are validated before storage:
+- Scheme is allow-listed to http and https only.
+- Hosts are checked for embedded credentials (username and password in the URL are rejected).
+- Literal IPv4 and IPv6 addresses are parsed including non-canonical forms (decimal, octal, hex, and IPv4-mapped/IPv4-compatible/6to4/Teredo variants).
+- All addresses (literal or resolved) are checked against a denylist covering loopback (127.0.0.0/8, ::1), private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7), link-local (169.254.0.0/16, fe80::/10), CGNAT (100.64.0.0/10), cloud metadata (169.254.169.254, fd00:ec2::254), multicast, unspecified and reserved ranges.
+- When DNS resolution is enabled (LINKS_DNS_RESOLUTION_ENABLED=true), every resulting address is checked against the denylist. When resolution fails or no addresses are returned, the request is rejected.
+
+The service never makes outbound HTTP requests to a destination. Redirect destinations always come from the validated, stored database row.
+
+Click analytics contain no client IP address, no client identifiers and no user identity. The clicks table has no column capable of storing an address.
+
+No secrets are read or stored by the service.
+
+## Known Limits
+
+Rate limiter tracks up to MAX_TRACKED_KEYS (20000) distinct buckets across per-IP creation, per-IP redirect and per-API-key creation namespaces. When this limit is exceeded, least-recently-seen entries are evicted. Headers with unrecognised keys never create rate limit buckets, so arbitrary header values cannot exhaust memory.
+
+The database uses SQLite with WAL journalling enabled. Concurrent writes are serialised; a click insert does not block concurrent redirect reads. One connection per request is opened and closed.
+
+Short code generation uses a cryptographically secure random source. Collisions are retried up to LINKS_CODE_MAX_ATTEMPTS times before returning 503 code_generation_failed.

@@ -19,6 +19,7 @@ from keel.governance.approvals import AutoApprovalBroker, ScriptedApprovalBroker
 from keel.governance.audit import AuditLog
 from keel.governance.lineage import LineageStore
 from keel.governance.policy import PolicyEngine, SecretScanRule
+from keel.models import PolicyViolation, Severity
 from keel.models import (
     Artifact,
     AuditEventType,
@@ -722,3 +723,99 @@ def test_writing_over_a_dependency_output_is_not_a_conflict(tmp_path):
         and e.payload.get("rule") == "orchestration.concurrent_write"
     ]
     assert not conflicts, "an ordered overwrite was reported as a race"
+
+
+def test_entry_gate_does_not_judge_upstream_content(tmp_path):
+    """Regression: a node was denied for a neighbour's truncated output.
+
+    The entry gate was handed the dependencies' outputs as JSON, truncated to
+    12k characters. A live run denied the verification node for an unguarded
+    redirect because the handler appeared inside that summary and the SSRF
+    guard had been truncated away. The node had not run, its inputs were fine,
+    and the code it was about to test was correct.
+    """
+    from keel.governance.policy import OpenRedirectRule, PolicyEngine
+
+    unguarded = (
+        "from fastapi.responses import RedirectResponse\n"
+        "def follow(code):\n"
+        "    return RedirectResponse(lookup(code))\n"
+    )
+    plan = Plan(nodes=[node("producer"), node("consumer", ["producer"])])
+    ex, disp, _, _ = build(tmp_path, plan, policy=PolicyEngine([OpenRedirectRule()]))
+
+    async def dispatch(node_id, skill_id, tier, payload):
+        disp.calls.append((node_id, tier))
+        if node_id == "producer":
+            # Output that would trip a content rule if the gate scanned it.
+            return StageOutcome(state=TaskState.COMPLETED, parsed={"files": [], "src": unguarded})
+        return ok()
+
+    disp.dispatch = dispatch
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.results["consumer"].state is TaskState.COMPLETED, (
+        f"consumer was denied for its upstream's content: {result.results['consumer'].error}"
+    )
+
+
+def test_entry_gate_still_denies_a_node_whose_input_never_arrived(tmp_path):
+    """Scoping the gate must not make it vacuous.
+
+    The scheduler will not offer a node until its dependencies complete, so in
+    a healthy run this guard is unreachable. It is a backstop for the paths
+    that do discard a completed result, such as a repair, which is exactly
+    where an ordering assumption would otherwise go unchecked.
+    """
+    plan = Plan(nodes=[node("a"), node("b", ["a"])])
+    ex, _, _, _ = build(tmp_path, plan)
+
+    spec = plan.by_id("b")
+    allowed = asyncio.run(ex._run_node(spec, {"problem": PROBLEM, "outputs": {"a": {}}}))
+    denied = asyncio.run(ex._run_node(spec, {"problem": PROBLEM, "outputs": {}}))
+
+    assert allowed.state is TaskState.COMPLETED
+    assert denied.state is TaskState.REJECTED
+    assert "required upstream output missing: a" in (denied.error or "")
+
+
+def test_repair_does_not_fire_when_verification_was_never_run(tmp_path):
+    """Regression: repair burned its budget on a gate rejection.
+
+    A rejection means the node never executed, so regenerating the
+    implementation cannot address it. A live run repaired twice against a
+    verification that had been denied at its entry gate.
+    """
+    plan = _repair_plan()
+    ex, disp, audit, _ = build(tmp_path, plan)
+    ex.max_repairs = 2
+
+    async def dispatch(node_id, skill_id, tier, payload):
+        disp.calls.append((node_id, tier))
+        return ok()
+
+    disp.dispatch = dispatch
+
+    # Deny verify at its entry gate, which is how the live failure happened:
+    # the node never executed, so there is nothing for a repair to fix.
+    class DenyVerifyEntry:
+        rule_id = "test.deny_verify"
+        severity = Severity.HIGH
+
+        def evaluate(self, artifacts, spec):
+            if spec.id != VERIFY:
+                return []
+            return [
+                PolicyViolation(
+                    rule_id=self.rule_id,
+                    severity=self.severity,
+                    message="denied before running",
+                )
+            ]
+
+    ex.policy = PolicyEngine([DenyVerifyEntry()])
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.repairs == 0, "repair fired on a node that never ran"
+    assert not any(e.event_type is AuditEventType.REPAIR_STARTED for e in audit.events())
+    assert disp.count(IMPLEMENT) == 1, "the implementation was regenerated for nothing"

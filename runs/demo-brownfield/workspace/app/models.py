@@ -1,67 +1,50 @@
-"""Typed request and response models validated at the HTTP boundary."""
+"""Typed request and response models validated at the service boundary.
+
+Request models run in pydantic strict mode with ``extra="forbid"``: invalid
+input is rejected rather than coerced, and every string carries a length limit
+before it can reach the database.
+"""
 
 from __future__ import annotations
 
-from typing import List, Optional
+from datetime import datetime
+from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from typing_extensions import Annotated
+from pydantic import BaseModel, ConfigDict, Field
 
-from .config import ABSOLUTE_MAX_URL_LENGTH, MAX_EXPIRES_AT_LENGTH
-
-UrlStr = Annotated[
-    str,
-    StringConstraints(strict=True, min_length=1, max_length=ABSOLUTE_MAX_URL_LENGTH),
-]
-
-ExpiryStr = Annotated[
-    str,
-    StringConstraints(strict=True, min_length=1, max_length=MAX_EXPIRES_AT_LENGTH),
-]
+from .config import ABSOLUTE_MAX_TTL_SECONDS, ABSOLUTE_MAX_URL_LENGTH
 
 
 class CreateLinkRequest(BaseModel):
-    """Body of ``POST /api/links``."""
+    """Payload accepted by ``POST /api/links``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    url: UrlStr = Field(
-        ...,
-        description="Public http(s) destination URL to shorten.",
-    )
-    expires_at: Optional[ExpiryStr] = Field(
-        default=None,
-        description="Optional ISO-8601 expiry instant; must be in the future.",
-    )
+    target_url: str = Field(min_length=1, max_length=ABSOLUTE_MAX_URL_LENGTH)
+    expires_in_seconds: Optional[int] = Field(default=None, ge=0, le=ABSOLUTE_MAX_TTL_SECONDS)
 
 
 class CreateLinkResponse(BaseModel):
-    """Body returned by a successful ``POST /api/links``."""
+    """Body returned by ``POST /api/links``."""
 
     code: str
     short_url: str
-    url: str
-    created_at: str
-    expires_at: str
-
-
-class ClickEntry(BaseModel):
-    """A single recorded redirect, free of any client address."""
-
-    timestamp: str
-    referrer: Optional[str] = None
-    user_agent: Optional[str] = None
+    target_url: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
 
 
 class StatsResponse(BaseModel):
     """Body returned by ``GET /api/links/{code}/stats``."""
 
     code: str
-    url: str
-    created_at: str
-    expires_at: str
-    total_clicks: int
-    clicks: List[ClickEntry]
+    short_url: str
+    target_url: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    expired: bool
+    clicks: int
+    last_clicked_at: Optional[datetime] = None
 
 
 class HealthResponse(BaseModel):

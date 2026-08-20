@@ -91,8 +91,16 @@ BROWNFIELD = Scenario(
         "or an unknown one, keeps the existing per-IP limit exactly as it "
         "behaves today, so existing clients continue to work unchanged.\n\n"
         "A caller over its quota receives HTTP 429 with a Retry-After header "
-        "giving whole seconds until the window resets. Redirects are not rate "
-        "limited; only link creation is."
+        "giving whole seconds until the window resets.\n\n"
+        # An earlier wording said only "redirects are not rate limited", and
+        # the analyst refused to plan it: the service already throttles
+        # redirects per IP, so that sentence could mean "remove that" or "do
+        # not extend key limiting to it". It read the existing rate limiter and
+        # caught the contradiction, which is the codebase reasoning this
+        # scenario is meant to exercise. Saying which one is meant is the fix.
+        "This change is additive. The existing per-IP throttle on redirects "
+        "stays exactly as it is; do not remove or weaken it. Per-key limiting "
+        "applies only to link creation, and redirects are never limited by key."
     ),
     expects=ScenarioKind.BROWNFIELD,
     demonstrates=[

@@ -31,6 +31,7 @@ from keel.dispatch import StageDispatcher, StageOutcome
 from keel.graph import PlanGraph
 from keel.models import (
     ApprovalRequest,
+    GateDecision,
     Artifact,
     AuditEventType,
     EngineeringProblem,
@@ -217,7 +218,32 @@ class Executor:
             result.error = "human declined the change"
             return self._finish(node, result)
 
-        entry = self.policy.decide("entry", node, self._inputs_for(node, context))
+        # Called for its side effect: this is where the lineage store learns
+        # which version of which upstream artifact this node consumed.
+        self._inputs_for(node, context)
+
+        # The entry gate is handed no content on purpose.
+        #
+        # Content rules judge what a node produced, and at entry it has
+        # produced nothing. Passing the upstream outputs made them re-judge a
+        # neighbour's work, on a JSON summary truncated to 12k characters. A
+        # live run denied the verification node for an unguarded redirect
+        # because the handler appeared inside that summary and the SSRF guard
+        # had been truncated away. The node had not run, its inputs were fine,
+        # and the code it was about to test was correct.
+        #
+        # What still applies here is node-scoped policy such as change control,
+        # which keys on the node rather than on artifacts, plus the concrete
+        # precondition check below.
+        entry = self.policy.decide("entry", node, [])
+        if entry.allowed:
+            missing = [d for d in node.depends_on if d not in context["outputs"]]
+            if missing:
+                entry = GateDecision.deny(
+                    "entry",
+                    node.id,
+                    f"required upstream output missing: {', '.join(sorted(missing))}",
+                )
         result.gate_decisions.append(entry)
         self.audit.emit(
             AuditEventType.GATE_DECISION,
@@ -620,6 +646,12 @@ class Executor:
         Returns True when a repair was scheduled, False to let the run stop.
         """
         if node.id != VERIFY:
+            return False
+        # Only a real test failure is repairable. A rejection means the node
+        # never ran, so regenerating the implementation cannot address it and
+        # would burn the budget on the wrong problem. A live run did exactly
+        # that twice before this check existed.
+        if outcome.state is not TaskState.FAILED:
             return False
         if result.repairs >= self.max_repairs:
             return False

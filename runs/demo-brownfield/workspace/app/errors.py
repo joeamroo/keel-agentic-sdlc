@@ -1,22 +1,23 @@
-"""Stable JSON error envelope and the handlers that emit it.
+"""Stable error envelope and exception handlers.
 
-Every error response has the shape ``{"error": {"code": ..., "message": ...}}`` and
-never carries a stack trace, a database error string or a filesystem path.
+Every error response emitted by the service has the shape
+``{"error": {"code": ..., "message": ...}}``.  Handlers never leak stack
+traces, database error strings or filesystem paths.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-LOGGER = logging.getLogger("shortener.errors")
+logger = logging.getLogger("shortener.errors")
 
-STATUS_ERROR_CODES: Dict[int, str] = {
+_STATUS_CODES: Mapping[int, str] = {
     400: "bad_request",
     401: "unauthorized",
     403: "forbidden",
@@ -25,117 +26,118 @@ STATUS_ERROR_CODES: Dict[int, str] = {
     409: "conflict",
     413: "payload_too_large",
     415: "unsupported_media_type",
-    422: "validation_error",
+    422: "invalid_request",
     429: "rate_limited",
     500: "internal_error",
-    503: "service_unavailable",
+    503: "unavailable",
+}
+
+_STATUS_MESSAGES: Mapping[int, str] = {
+    400: "The request could not be understood.",
+    404: "Not found.",
+    405: "Method not allowed.",
+    422: "The request payload is invalid.",
+    429: "Rate limit exceeded. Please retry later.",
+    500: "An internal error occurred.",
+    503: "The service is temporarily unavailable.",
 }
 
 
-def error_payload(code: str, message: str) -> Dict[str, Dict[str, str]]:
-    """Build the canonical error envelope.
+class ApiError(Exception):
+    """Application level error carrying an HTTP status and envelope code."""
 
-    Args:
-        code: Stable machine-readable error code.
-        message: Human-readable, non-sensitive description.
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        """Create an API error.
 
-    Returns:
-        The envelope dictionary ready to be serialised as JSON.
+        Stores the HTTP status, the stable envelope code and a safe,
+        client-facing message.  Raises nothing.
+        """
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 
-    Raises:
-        Nothing.
+
+def error_body(code: str, message: str) -> Dict[str, Any]:
+    """Build the stable error envelope body.
+
+    Returns a JSON-serialisable dict of the form
+    ``{"error": {"code": code, "message": message}}``.  Raises nothing.
     """
     return {"error": {"code": code, "message": message}}
 
 
-class ApiError(StarletteHTTPException):
-    """HTTP exception carrying a stable error code for the JSON envelope."""
+def error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    headers: Optional[Dict[str, str]] = None,
+) -> JSONResponse:
+    """Build a JSONResponse carrying the stable error envelope.
 
-    def __init__(
-        self,
-        status_code: int,
-        error_code: str,
-        message: str,
-        headers: Optional[Mapping[str, str]] = None,
-    ) -> None:
-        """Create an API error.
-
-        Args:
-            status_code: HTTP status to return.
-            error_code: Stable code placed in ``error.code``.
-            message: Safe message placed in ``error.message``.
-            headers: Optional extra response headers.
-
-        Returns:
-            None.
-
-        Raises:
-            Nothing.
-        """
-        super().__init__(status_code=status_code, detail=message, headers=dict(headers or {}))
-        self.error_code = error_code
-
-
-async def api_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Render any HTTP exception through the shared error envelope.
-
-    Args:
-        request: The incoming request (unused beyond logging context).
-        exc: The raised exception; expected to be an HTTPException subclass.
-
-    Returns:
-        A :class:`JSONResponse` carrying the error envelope.
-
-    Raises:
-        Nothing.
+    Returns the response with ``Cache-Control: no-store`` always set plus any
+    extra headers supplied.  Raises nothing.
     """
-    if not isinstance(exc, StarletteHTTPException):
-        return await unhandled_error_handler(request, exc)
-    error_code = getattr(exc, "error_code", None) or STATUS_ERROR_CODES.get(exc.status_code, "error")
-    detail = exc.detail if isinstance(exc.detail, str) and exc.detail else "Request failed."
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=error_payload(str(error_code), detail),
-        headers=dict(exc.headers or {}),
-    )
+    final_headers: Dict[str, str] = {"Cache-Control": "no-store"}
+    if headers:
+        final_headers.update(headers)
+    return JSONResponse(status_code=status_code, content=error_body(code, message), headers=final_headers)
 
 
-async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Render request-model validation failures as a 422 envelope.
+async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+    """Render an :class:`ApiError` in the stable envelope.
 
-    Args:
-        request: The incoming request (unused).
-        exc: The raised :class:`RequestValidationError`.
-
-    Returns:
-        A 422 :class:`JSONResponse` with a generic, non-leaking message.
-
-    Raises:
-        Nothing.
+    Returns a JSONResponse with the error's status code.  Raises nothing.
     """
-    if isinstance(exc, RequestValidationError):
-        LOGGER.info("Rejected invalid request body or parameters for %s", request.url.path)
-    return JSONResponse(
-        status_code=422,
-        content=error_payload("validation_error", "Request validation failed."),
-    )
+    del request
+    return error_response(exc.status_code, exc.code, exc.message)
 
 
-async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Render an unexpected exception as a 500 envelope without leaking details.
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Render Starlette/FastAPI HTTP exceptions in the stable envelope.
 
-    Args:
-        request: The incoming request, used only for a server-side log line.
-        exc: The unhandled exception.
-
-    Returns:
-        A 500 :class:`JSONResponse` with a fixed message.
-
-    Raises:
-        Nothing.
+    Returns a JSONResponse whose envelope code is derived from the status code.
+    Raises nothing.
     """
-    LOGGER.exception("Unhandled error while serving %s %s", request.method, request.url.path)
-    return JSONResponse(
-        status_code=500,
-        content=error_payload("internal_error", "Internal server error."),
-    )
+    del request
+    code = _STATUS_CODES.get(exc.status_code, "error")
+    message = _STATUS_MESSAGES.get(exc.status_code)
+    if message is None:
+        detail = exc.detail
+        message = detail if isinstance(detail, str) and detail else "Request failed."
+    headers: Dict[str, str] = {}
+    if exc.headers:
+        for name, value in exc.headers.items():
+            headers[str(name)] = str(value)
+    return error_response(exc.status_code, code, message, headers=headers)
+
+
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Render request validation failures in the stable envelope.
+
+    Returns a 422 JSONResponse with a generic message; field level details are
+    deliberately not echoed back.  Raises nothing.
+    """
+    del request, exc
+    return error_response(422, "invalid_request", _STATUS_MESSAGES[422])
+
+
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Render an unexpected exception as a generic 500.
+
+    Returns a 500 JSONResponse with no internal detail.  Raises nothing.
+    """
+    del request
+    logger.error("Unhandled error of type %s", type(exc).__name__)
+    return error_response(500, "internal_error", _STATUS_MESSAGES[500])
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    """Attach the stable-envelope exception handlers to an application.
+
+    Returns ``None``.  Raises nothing.
+    """
+    app.add_exception_handler(ApiError, api_error_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(Exception, unhandled_exception_handler)

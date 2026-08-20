@@ -1,20 +1,20 @@
 """Timezone-aware timestamp helpers.
 
-Every timestamp handled by the service is timezone aware and stored as RFC 3339
-UTC text, so expiry comparisons cannot go wrong across a deployment boundary.
+Every timestamp handled by the service is timezone aware and serialised as
+RFC3339 UTC with a trailing ``Z``; naive datetimes are rejected at the boundary
+of these helpers so expiry logic cannot silently drift across deployments.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
 
 
-def utc_now() -> datetime:
-    """Return the current instant as a timezone-aware UTC datetime.
+def utcnow() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime.
 
     Returns:
-        The current time with ``tzinfo`` set to UTC.
+        A ``datetime`` whose ``tzinfo`` is ``timezone.utc``.
 
     Raises:
         Nothing.
@@ -22,65 +22,43 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def to_rfc3339(moment: datetime) -> str:
-    """Render a timezone-aware datetime as RFC 3339 UTC text.
+def to_rfc3339(value: datetime) -> str:
+    """Serialise a timezone-aware datetime as RFC3339 UTC.
 
     Args:
-        moment: A timezone-aware datetime.
+        value: A timezone-aware datetime.
 
     Returns:
-        The instant in UTC, e.g. ``2024-01-01T00:00:00.000000Z``.
+        A string such as ``2024-01-01T00:00:00.000Z``.
 
     Raises:
-        ValueError: If ``moment`` is naive (no tzinfo).
+        ValueError: If ``value`` is naive (has no tzinfo/utcoffset).
     """
-    if moment.tzinfo is None:
-        raise ValueError("Refusing to serialise a naive datetime.")
-    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("a timezone-aware datetime is required")
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def parse_rfc3339(value: str) -> datetime:
-    """Parse RFC 3339 text into a timezone-aware UTC datetime.
+    """Parse an RFC3339 UTC timestamp produced by :func:`to_rfc3339`.
 
     Args:
-        value: Timestamp text, with or without a trailing ``Z``.
+        value: The stored timestamp string.
 
     Returns:
-        The parsed instant, normalised to UTC.
+        A timezone-aware datetime normalised to UTC.
 
     Raises:
-        ValueError: If the text is not a parsable timestamp.
+        ValueError: If the string cannot be parsed as a timestamp.
     """
     text = value.strip()
+    if not text:
+        raise ValueError("empty timestamp")
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def is_expired(expires_at: Optional[str], now: datetime) -> bool:
-    """Decide whether a stored expiry timestamp has passed.
-
-    Args:
-        expires_at: Stored RFC 3339 text, or ``None`` for a link that never expires.
-        now: Timezone-aware reference instant.
-
-    Returns:
-        ``True`` when the link is expired (or its stored timestamp is unreadable,
-        which is treated as expired so a corrupt row fails closed), ``False``
-        otherwise.
-
-    Raises:
-        ValueError: If ``now`` is naive.
-    """
-    if now.tzinfo is None:
-        raise ValueError("Refusing to compare against a naive datetime.")
-    if expires_at is None:
-        return False
-    try:
-        deadline = parse_rfc3339(expires_at)
-    except ValueError:
-        return True
-    return deadline <= now

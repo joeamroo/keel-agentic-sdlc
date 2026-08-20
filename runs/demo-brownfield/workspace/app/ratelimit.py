@@ -1,335 +1,298 @@
-"""Fixed-window rate limiting for POST /api/links.
+"""In-process sliding window rate limiting ASGI middleware.
 
-Enforcement lives in one place: a pure ASGI middleware that runs before routing and
-before body parsing, scoped to exactly ``POST /api/links``. A throttled request
-therefore never opens a database connection and never writes a row, and no other
-route (``/health``, ``/{code}``, the stats endpoint) can ever be refused with 429.
+The middleware runs before routing and body parsing, so a refused request never
+opens a database connection.  Three bucket namespaces share one bounded map:
+
+``ip:``   per client address budget for ``POST /api/links``
+``rip:``  per client address budget for redirects
+``key:``  per recognised API key budget for ``POST /api/links``
+
+Bucket identities are per-boot salted SHA-256 digests; neither a raw client
+address nor a raw API key is ever stored, logged or returned.
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
 import math
+import re
+import secrets
 import threading
 import time
-from typing import Callable, Dict, Mapping, NamedTuple, Optional, Tuple
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, MutableMapping, Optional, Tuple
 
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .apikeys import ApiKeyEntry, lookup_api_key, salted_digest
+from .config import Config
+from .errors import error_response
 
-#: Upper bound on entries tracked in each bucket map, applied independently.
-MAX_TRACKED_KEYS: int = 10000
+#: Upper bound on the number of tracked buckets across every namespace.
+MAX_TRACKED_KEYS: int = 10_000
 
-#: The only path the limiter guards.
-CREATE_LINK_PATH: str = "/api/links"
+#: Redirects are allowed this multiple of the per-IP creation allowance.
+REDIRECT_LIMIT_MULTIPLIER: int = 10
 
-RATE_LIMITED_BODY: bytes = json.dumps(
-    {"error": {"code": "rate_limited", "message": "Rate limit exceeded. Please retry later."}},
-    separators=(",", ":"),
-).encode("utf-8")
+#: API key quotas are declared per minute; the key window is fixed.
+KEY_WINDOW_SECONDS: float = 60.0
+
+API_KEY_HEADER = b"x-api-key"
+CREATE_PATH = "/api/links"
+REDIRECT_METHODS = frozenset({"GET", "HEAD"})
+_CODE_PATH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_RESERVED_SEGMENTS = frozenset({"health", "docs", "redoc", "openapi", "favicon"})
+
+RATE_LIMITED_MESSAGE = "Rate limit exceeded. Please retry later."
 
 
-class RateLimitDecision(NamedTuple):
-    """Outcome of a limiter consultation.
+@dataclass
+class RateLimitBucket:
+    """Sliding window state for one bucket identity."""
 
-    Attributes:
-        allowed: Whether the request may proceed.
-        retry_after: Whole seconds to wait; meaningful only when refused.
+    limit: int
+    window_seconds: float
+    last_seen: float
+    timestamps: Deque[float] = field(default_factory=deque)
+
+
+@dataclass(frozen=True)
+class _BucketSpec:
+    """Which bucket a request should be charged against."""
+
+    bucket_id: str
+    limit: int
+    window_seconds: float
+
+
+def _normalise_path(raw_path: str) -> str:
+    """Normalise a request path for matching.
+
+    Returns the path without a trailing slash (the root path stays ``"/"``).
+    Raises nothing.
     """
-
-    allowed: bool
-    retry_after: int
-
-
-class RateLimiter:
-    """In-process fixed-window counters for unkeyed and keyed link creation.
-
-    Two namespaces are kept: ``ip_buckets`` for callers without a recognised API key
-    and ``key_buckets`` for callers presenting one. A recognised key substitutes for
-    the per-IP bucket rather than adding to it, so a configured quota means exactly
-    what the operator wrote. State is lost on restart.
-    """
-
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        max_requests: int,
-        window_seconds: int,
-        trust_forwarded_for: bool,
-        api_key_quotas: Mapping[bytes, ApiKeyEntry],
-    ) -> None:
-        """Create a limiter.
-
-        Args:
-            enabled: Master switch; when false nothing is counted or refused.
-            max_requests: Per-window allowance of the per-IP bucket.
-            window_seconds: Fixed-window length, shared by all buckets.
-            trust_forwarded_for: Whether to use the leftmost X-Forwarded-For entry
-                as the per-IP identity.
-            api_key_quotas: Digest-keyed quota table built at startup.
-
-        Returns:
-            None.
-
-        Raises:
-            Nothing.
-        """
-        self.enabled: bool = bool(enabled)
-        self.max_requests: int = max(1, int(max_requests))
-        self.window_seconds: int = max(1, int(window_seconds))
-        self.trust_forwarded_for: bool = bool(trust_forwarded_for)
-        self.api_key_quotas: Dict[bytes, ApiKeyEntry] = dict(api_key_quotas)
-        self.ip_buckets: Dict[bytes, Tuple[float, int]] = {}
-        self.key_buckets: Dict[bytes, Tuple[float, int]] = {}
-        self.clock: Callable[[], float] = time.monotonic
-        self.lock = threading.Lock()
-
-    def reset(self) -> None:
-        """Discard all counters.
-
-        Returns:
-            None.
-
-        Raises:
-            Nothing.
-        """
-        with self.lock:
-            self.ip_buckets.clear()
-            self.key_buckets.clear()
-
-    def _prune_locked(self, buckets: Dict[bytes, Tuple[float, int]], now: float) -> None:
-        """Bound a bucket map, dropping stale then oldest entries.
-
-        Must be called with :attr:`lock` held.
-
-        Args:
-            buckets: The map to prune in place.
-            now: Current clock reading.
-
-        Returns:
-            None.
-
-        Raises:
-            Nothing.
-        """
-        if len(buckets) <= MAX_TRACKED_KEYS:
-            return
-        stale = [key for key, (started, _) in buckets.items() if now - started >= self.window_seconds]
-        for key in stale:
-            del buckets[key]
-        overflow = len(buckets) - MAX_TRACKED_KEYS
-        if overflow <= 0:
-            return
-        oldest = sorted(buckets.items(), key=lambda item: item[1][0])[:overflow]
-        for key, _ in oldest:
-            del buckets[key]
-
-    def _consume(
-        self, buckets: Dict[bytes, Tuple[float, int]], identity: bytes, quota: int
-    ) -> RateLimitDecision:
-        """Count one request against a bucket and decide whether to allow it.
-
-        Args:
-            buckets: The namespace to charge (per-IP or per-key).
-            identity: Salted digest identifying the caller within that namespace.
-            quota: Requests permitted per window for this identity.
-
-        Returns:
-            A :class:`RateLimitDecision`.
-
-        Raises:
-            Nothing.
-        """
-        with self.lock:
-            now = self.clock()
-            started, count = buckets.get(identity, (now, 0))
-            if now - started >= self.window_seconds:
-                started, count = now, 0
-            if count >= quota:
-                remaining = (started + self.window_seconds) - now
-                retry_after = int(math.ceil(remaining)) if remaining > 0 else 1
-                retry_after = max(1, min(self.window_seconds, retry_after))
-                buckets[identity] = (started, count)
-                return RateLimitDecision(allowed=False, retry_after=retry_after)
-            buckets[identity] = (started, count + 1)
-            self._prune_locked(buckets, now)
-            return RateLimitDecision(allowed=True, retry_after=0)
-
-    def check_create(self, api_key: Optional[str], client_address: str) -> RateLimitDecision:
-        """Consult the limiter for one POST /api/links request.
-
-        A recognised API key is charged to its own bucket using its own quota and
-        the per-IP bucket is neither read nor written. No key, a blank key or an
-        unrecognised key falls through to the per-IP bucket and allocates nothing
-        keyed by the header value.
-
-        Args:
-            api_key: Raw ``X-API-Key`` header value, if present.
-            client_address: Client identity for the per-IP bucket.
-
-        Returns:
-            A :class:`RateLimitDecision`; always allowed when limiting is disabled.
-
-        Raises:
-            Nothing.
-        """
-        if not self.enabled:
-            return RateLimitDecision(allowed=True, retry_after=0)
-        entry = lookup_api_key(self.api_key_quotas, api_key)
-        if entry is not None:
-            return self._consume(self.key_buckets, entry.digest, entry.quota)
-        identity = salted_digest(client_address.encode("utf-8", errors="replace"))
-        return self._consume(self.ip_buckets, identity, self.max_requests)
-
-
-def header_value(scope: Scope, name: bytes) -> Optional[str]:
-    """Read a single request header from an ASGI scope.
-
-    Args:
-        scope: The ASGI HTTP scope.
-        name: Lower-case header name as bytes.
-
-    Returns:
-        The decoded header value, or ``None`` when absent or undecodable.
-
-    Raises:
-        Nothing.
-    """
-    for raw_name, raw_value in scope.get("headers", []):
-        if raw_name == name:
-            try:
-                return raw_value.decode("utf-8")
-            except UnicodeDecodeError:
-                return None
-    return None
-
-
-def client_address(scope: Scope, trust_forwarded_for: bool) -> str:
-    """Determine the per-IP bucket identity for a request.
-
-    Args:
-        scope: The ASGI HTTP scope.
-        trust_forwarded_for: Whether to honour ``X-Forwarded-For``.
-
-    Returns:
-        The client address text, or ``"unknown"`` when it cannot be determined.
-
-    Raises:
-        Nothing.
-    """
-    if trust_forwarded_for:
-        forwarded = header_value(scope, b"x-forwarded-for")
-        if forwarded:
-            first = forwarded.split(",")[0].strip()
-            if first:
-                return first[:255]
-    client = scope.get("client")
-    if client and isinstance(client, (tuple, list)) and client[0]:
-        return str(client[0])[:255]
-    return "unknown"
-
-
-def _normalised_path(scope: Scope) -> str:
-    """Return the request path without root prefix or trailing slash.
-
-    Args:
-        scope: The ASGI HTTP scope.
-
-    Returns:
-        The normalised path, always beginning with ``/``.
-
-    Raises:
-        Nothing.
-    """
-    path = scope.get("path") or "/"
-    root_path = scope.get("root_path") or ""
-    if root_path and path.startswith(root_path):
-        path = path[len(root_path) :] or "/"
-    if len(path) > 1:
-        path = path.rstrip("/") or "/"
-    return path
+    if not raw_path:
+        return "/"
+    if len(raw_path) > 1 and raw_path.endswith("/"):
+        return raw_path.rstrip("/") or "/"
+    return raw_path
 
 
 class RateLimitMiddleware:
-    """ASGI middleware applying :class:`RateLimiter` to link creation only."""
+    """ASGI middleware enforcing per-IP and per-API-key request budgets."""
 
-    def __init__(self, app: ASGIApp, limiter: RateLimiter) -> None:
-        """Wrap an ASGI application.
+    def __init__(self, app: ASGIApp, config: Config) -> None:
+        """Create the middleware with a per-boot salt and empty bucket map.
 
-        Args:
-            app: The next application in the stack.
-            limiter: Shared limiter instance (also exposed on ``app.state``).
-
-        Returns:
-            None.
-
-        Raises:
-            Nothing.
+        Returns ``None``.  Raises nothing.
         """
         self.app = app
-        self.limiter = limiter
-
-    def _guards(self, scope: Scope) -> bool:
-        """Report whether this request is subject to limiting.
-
-        Args:
-            scope: The ASGI HTTP scope.
-
-        Returns:
-            ``True`` only for ``POST /api/links``.
-
-        Raises:
-            Nothing.
-        """
-        method = str(scope.get("method", "")).upper()
-        return method == "POST" and _normalised_path(scope) == CREATE_LINK_PATH
-
-    async def _send_rate_limited(self, send: Send, retry_after: int) -> None:
-        """Emit the 429 refusal response.
-
-        Args:
-            send: The ASGI send callable.
-            retry_after: Whole seconds for the ``Retry-After`` header.
-
-        Returns:
-            None.
-
-        Raises:
-            Nothing.
-        """
-        headers = [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(RATE_LIMITED_BODY)).encode("ascii")),
-            (b"retry-after", str(retry_after).encode("ascii")),
-            (b"cache-control", b"no-store"),
-        ]
-        await send({"type": "http.response.start", "status": 429, "headers": headers})
-        await send({"type": "http.response.body", "body": RATE_LIMITED_BODY, "more_body": False})
+        self.config = config
+        self._buckets: MutableMapping[str, RateLimitBucket] = {}
+        self._lock = threading.Lock()
+        self._salt = secrets.token_hex(16)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Handle one ASGI event stream.
+        """Charge the request against its bucket, or refuse it with 429.
 
-        Args:
-            scope: The ASGI scope.
-            receive: The ASGI receive callable.
-            send: The ASGI send callable.
-
-        Returns:
-            None.
-
-        Raises:
-            Exception: Anything raised by the wrapped application.
+        Returns ``None``; either forwards the request downstream or sends a 429
+        response carrying ``Retry-After`` and ``Cache-Control: no-store``.
+        Raises whatever the downstream application raises.
         """
-        if scope.get("type") != "http" or not self._guards(scope):
+        if scope.get("type") != "http" or not self.config.rate_limit_enabled:
             await self.app(scope, receive, send)
             return
-        decision = self.limiter.check_create(
-            header_value(scope, b"x-api-key"),
-            client_address(scope, self.limiter.trust_forwarded_for),
+
+        spec = self._classify(scope)
+        if spec is None:
+            await self.app(scope, receive, send)
+            return
+
+        retry_after = self._consume(spec)
+        if retry_after is None:
+            await self.app(scope, receive, send)
+            return
+
+        response = error_response(
+            429,
+            "rate_limited",
+            RATE_LIMITED_MESSAGE,
+            headers={"Retry-After": str(retry_after)},
         )
-        if decision.allowed:
-            await self.app(scope, receive, send)
+        await response(scope, receive, self._wrap_send(send))
+
+    @staticmethod
+    def _wrap_send(send: Send) -> Send:
+        """Return the send callable unchanged.
+
+        Exists as a single seam for response instrumentation.  Returns the send
+        callable.  Raises nothing.
+        """
+
+        async def _send(message: Message) -> None:
+            """Forward an ASGI message downstream.
+
+            Returns ``None``.  Raises whatever the wrapped send raises.
+            """
+            await send(message)
+
+        return _send
+
+    def _hash(self, namespace: str, value: str) -> str:
+        """Build a namespaced, salted bucket identity.
+
+        Returns ``"<namespace>:<sha256 hex digest>"``; the raw value never
+        appears in the result.  Raises nothing.
+        """
+        digest = hashlib.sha256(f"{self._salt}{value}".encode("utf-8")).hexdigest()
+        return f"{namespace}:{digest}"
+
+    @staticmethod
+    def _client_host(scope: Scope) -> str:
+        """Extract the peer address from the ASGI scope.
+
+        Returns the client host, or ``"unknown"`` when the server did not supply
+        one.  The value comes from the transport, not from a forgeable header.
+        Raises nothing.
+        """
+        client: Any = scope.get("client")
+        if isinstance(client, (tuple, list)) and client:
+            host = client[0]
+            if isinstance(host, str) and host:
+                return host
+        return "unknown"
+
+    @staticmethod
+    def _extract_api_key(scope: Scope) -> Optional[str]:
+        """Read the X-API-Key header value from the scope.
+
+        The header name is matched case-insensitively (ASGI lowercases it) and
+        the value is stripped; a blank value is treated as absent.  Returns the
+        stripped key or ``None``.  Raises nothing.
+        """
+        headers = scope.get("headers") or []
+        for raw_name, raw_value in headers:
+            if raw_name.lower() == API_KEY_HEADER:
+                try:
+                    value = raw_value.decode("latin-1").strip()
+                except (UnicodeDecodeError, AttributeError):
+                    return None
+                return value or None
+        return None
+
+    def _classify(self, scope: Scope) -> Optional[_BucketSpec]:
+        """Decide which bucket, if any, a request must be charged against.
+
+        Returns a :class:`_BucketSpec` for rate limited routes and ``None`` for
+        everything else (health, stats, docs, unknown routes).  Raises nothing.
+        """
+        method = str(scope.get("method", "")).upper()
+        path = _normalise_path(str(scope.get("path", "/")))
+
+        if method == "POST" and path == CREATE_PATH:
+            api_key = self._extract_api_key(scope)
+            if api_key is not None:
+                quota = self.config.api_key_quotas.get(api_key)
+                if quota is not None and quota >= 1:
+                    return _BucketSpec(
+                        bucket_id=self._hash("key", api_key),
+                        limit=int(quota),
+                        window_seconds=KEY_WINDOW_SECONDS,
+                    )
+            return _BucketSpec(
+                bucket_id=self._hash("ip", self._client_host(scope)),
+                limit=self.config.rate_limit_max,
+                window_seconds=self.config.rate_limit_window_seconds,
+            )
+
+        if method in REDIRECT_METHODS:
+            segments = [segment for segment in path.split("/") if segment]
+            if len(segments) == 1:
+                segment = segments[0]
+                if segment.lower() not in _RESERVED_SEGMENTS and _CODE_PATH_RE.match(segment):
+                    return _BucketSpec(
+                        bucket_id=self._hash("rip", self._client_host(scope)),
+                        limit=max(1, self.config.rate_limit_max * REDIRECT_LIMIT_MULTIPLIER),
+                        window_seconds=self.config.rate_limit_window_seconds,
+                    )
+        return None
+
+    def _consume(self, spec: _BucketSpec) -> Optional[int]:
+        """Record one request against a bucket.
+
+        Returns ``None`` when the request is within budget, otherwise the whole
+        number of seconds (>= 1) the caller must wait before capacity is
+        released.  Raises nothing.
+        """
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(spec.bucket_id)
+            if bucket is None:
+                bucket = RateLimitBucket(
+                    limit=spec.limit,
+                    window_seconds=spec.window_seconds,
+                    last_seen=now,
+                )
+                self._buckets[spec.bucket_id] = bucket
+            else:
+                bucket.limit = spec.limit
+                bucket.window_seconds = spec.window_seconds
+
+            cutoff = now - bucket.window_seconds
+            while bucket.timestamps and bucket.timestamps[0] <= cutoff:
+                bucket.timestamps.popleft()
+
+            bucket.last_seen = now
+            if len(bucket.timestamps) >= bucket.limit:
+                oldest = bucket.timestamps[0]
+                remaining = (oldest + bucket.window_seconds) - now
+                retry_after = max(1, int(math.ceil(remaining)))
+                retry_after = min(retry_after, max(1, int(math.ceil(bucket.window_seconds))))
+                self._prune_locked()
+                return retry_after
+
+            bucket.timestamps.append(now)
+            self._prune_locked()
+            return None
+
+    def _prune_locked(self) -> None:
+        """Evict least-recently-seen buckets when the map exceeds its bound.
+
+        Must be called while holding the lock.  Returns ``None``.  Raises
+        nothing.
+        """
+        overflow = len(self._buckets) - MAX_TRACKED_KEYS
+        if overflow <= 0:
             return
-        await self._send_rate_limited(send, decision.retry_after)
+        victims: list[Tuple[str, float]] = sorted(
+            ((bucket_id, bucket.last_seen) for bucket_id, bucket in self._buckets.items()),
+            key=lambda item: item[1],
+        )
+        for bucket_id, _ in victims[:overflow]:
+            self._buckets.pop(bucket_id, None)
+
+    def snapshot_size(self) -> int:
+        """Report how many buckets are currently tracked.
+
+        Returns the bucket count; exposed for diagnostics and tests only, never
+        the bucket contents.  Raises nothing.
+        """
+        with self._lock:
+            return len(self._buckets)
+
+
+__all__ = [
+    "MAX_TRACKED_KEYS",
+    "REDIRECT_LIMIT_MULTIPLIER",
+    "KEY_WINDOW_SECONDS",
+    "RateLimitBucket",
+    "RateLimitMiddleware",
+]
+
+
+def _unused(_message: Dict[str, Any]) -> None:
+    """Placeholder-free no-op kept out of the hot path.
+
+    Returns ``None``.  Raises nothing.
+    """
+    return None
