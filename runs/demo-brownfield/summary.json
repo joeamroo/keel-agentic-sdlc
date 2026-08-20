@@ -1,0 +1,95 @@
+{
+  "run_id": "demo-brownfield",
+  "scenario": "brownfield",
+  "requirement": "Add per-API-key rate limiting to the existing URL shortener.\n\nKeys come from the environment, not from the database. The variable SHORTENER_API_KEYS holds a comma-separated list of key:quota pairs, so a key named alpha with a quota of 100 and a key named beta with a quota of 20 are written as two such pairs. The quota is requests per minute for link creation. There is no admin surface and no schema change; an unknown key is treated as no key.\n\nA caller presents its key in an X-API-Key header. A request carrying a known key is limited against that key's quota. A request with no key, or an unknown one, keeps the existing per-IP limit exactly as it behaves today, so existing clients continue to work unchanged.\n\nA caller over its quota receives HTTP 429 with a Retry-After header giving whole seconds until the window resets. Redirects are not rate limited; only link creation is.",
+  "demonstrates": [
+    "codebase reasoning: impacted modules, routes and data flows",
+    "change control: modifying a public surface requires human approval",
+    "dynamic re-planning when analysis contradicts the original plan"
+  ],
+  "intake": {
+    "state": "completed",
+    "confidence": 0.82,
+    "scenario_detected": "brownfield",
+    "ambiguities": [
+      {
+        "question": "Should the existing per-IP throttle on GET /{code} redirects (currently LINKS_RATE_LIMIT_MAX x 100) be removed, given the sentence \"Redirects are not rate limited\"?",
+        "why": "Removing it deletes the redirect branch of RateLimitMiddleware._rule_for and leaves the redirect path with no flood protection; keeping it leaves that code and behaviour exactly as today. Only one of the two satisfies \"existing clients continue to work unchanged\".",
+        "blocking": false
+      },
+      {
+        "question": "Is the API-key window fixed at 60 seconds, or does it follow LINKS_RATE_LIMIT_WINDOW_SECONDS like the IP buckets?",
+        "why": "It decides whether the key bucket reads settings.rate_limit_window_seconds or a hard 60, which changes both the reset time and the ceiling on Retry-After when an operator tunes the window.",
+        "blocking": false
+      },
+      {
+        "question": "Does LINKS_RATE_LIMIT_ENABLED=false also disable the per-key quotas?",
+        "why": "If yes, the enabled flag short-circuits the whole middleware as it does today; if no, the middleware must keep running for keyed callers, which changes the early-return in __call__ and breaks the existing \"limiter can be disabled\" test for keyed traffic.",
+        "blocking": false
+      },
+      {
+        "question": "How should a malformed SHORTENER_API_KEYS entry be handled: ignored with a warning, or should it fail startup?",
+        "why": "Ignoring keeps the service up but silently downgrades a typo'd key to the per-IP limit; failing fast makes a deployment typo an outage. It decides whether config parsing raises or logs.",
+        "blocking": false
+      },
+      {
+        "question": "Should a 429 caused by a key quota be distinguishable from a 429 caused by the IP limit (for example a different error code or an X-RateLimit-* header)?",
+        "why": "It decides whether a new stable error code enters the public contract or the existing rate_limited code is reused for both cases.",
+        "blocking": false
+      }
+    ]
+  },
+  "run": {
+    "state": "failed",
+    "stopped_reason": "author-tests failed: APIStatusError: {'type': 'error', 'error': {'details': None, 'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CeDWxubCXr2W4pQmNstRG'}",
+    "plan_version": 1,
+    "plan_revisions": 0,
+    "nodes": {
+      "impact-analysis": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 117.019
+      },
+      "design": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 162.05
+      },
+      "implement": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 535.547
+      },
+      "author-tests": {
+        "state": "failed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 0.0
+      }
+    }
+  },
+  "metrics": {
+    "run_id": "demo-brownfield",
+    "total_nodes": 4,
+    "succeeded": 3,
+    "failed": 1,
+    "retries": 1,
+    "rollbacks": 1,
+    "fallbacks": 0,
+    "approvals_requested": 1,
+    "plan_revisions": 0,
+    "e2e_latency_seconds": 891.2618410587311,
+    "mttr_seconds": null,
+    "cost_usd": 2.13305,
+    "input_tokens": 54800,
+    "output_tokens": 74362,
+    "success_rate": 0.75
+  }
+}

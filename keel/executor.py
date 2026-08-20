@@ -121,7 +121,24 @@ class Executor:
             self.view.set_plan(plan)
 
         completed: set[str] = set()
-        context: dict[str, Any] = {"problem": problem, "outputs": {}}
+        context: dict[str, Any] = {
+            "problem": problem,
+            "outputs": {},
+            # The workspace as it was before any node wrote to it. Nodes that do
+            # not depend on the implementation see this rather than whatever
+            # happens to be on disk when they run, which is what makes their
+            # prompts deterministic.
+            "baseline_code": self._existing_code(),
+            # Whether a node can legitimately read generated code: only if it
+            # depends on the stage that writes it, in which case the write has
+            # already happened by the time the node runs.
+            "sees_implementation": {
+                n.id: IMPLEMENT in graph.ancestors(n.id) for n in plan.nodes
+            },
+            "ancestors": {n.id: graph.ancestors(n.id) for n in plan.nodes},
+            # path -> the node that last wrote it, for conflict detection.
+            "path_owner": {},
+        }
 
         try:
             while True:
@@ -162,6 +179,9 @@ class Executor:
                 revised = self._maybe_replan(graph, context, result)
                 if revised is not None:
                     graph = revised
+                    context["sees_implementation"] = {
+                        n.id: IMPLEMENT in graph.ancestors(n.id) for n in graph.plan.nodes
+                    }
 
             result.state = TaskState.COMPLETED
 
@@ -265,7 +285,7 @@ class Executor:
                 last_failure = result.error
                 continue
 
-            written = self._persist(node, outcome)
+            written = self._persist(node, outcome, context)
             written_paths.update(a.path for a in written if a.path)
             exit_gate = self.policy.decide("exit", node, written)
             result.gate_decisions.append(exit_gate)
@@ -377,7 +397,21 @@ class Executor:
         """
         problem: EngineeringProblem = context["problem"]
         outputs: dict[str, Any] = context["outputs"]
-        source = self._existing_code()
+
+        # A node sees generated code only when it depends on the stage that
+        # generates it. Otherwise it sees the pre-run baseline.
+        #
+        # This started as a replay bug: author-tests runs concurrently with
+        # implement, so the files on disk when it built its prompt depended on
+        # which finished first. That made its cassette key differ between the
+        # recording and the replay and the lookup missed. The underlying fault
+        # is worse than the symptom, because a node was reading state it had
+        # never declared a dependency on, which is exactly what the dependency
+        # graph exists to prevent.
+        if context.get("sees_implementation", {}).get(node.id):
+            source = self._existing_code()
+        else:
+            source = context.get("baseline_code") or "(empty workspace, this is a new system)"
 
         payload = {
             "requirement": problem.raw_requirement,
@@ -442,11 +476,57 @@ class Executor:
             self.lineage.record_consumption(node.id, artifact)
         return consumed
 
-    def _persist(self, node: NodeSpec, outcome: StageOutcome) -> list[Artifact]:
+    def _check_write_conflict(
+        self, node: NodeSpec, path: str, context: dict[str, Any]
+    ) -> None:
+        """Notice when two unrelated stages write the same file.
+
+        Concurrent nodes share one workspace, so if two of them write the same
+        path the surviving content is whichever finished last. That is a race,
+        and it is invisible: both stages succeed, both gates pass, and the
+        workspace simply holds one of two plausible answers.
+
+        A live run hit it. `document` and `implement` both wrote README.md, and
+        which one survived changed between the recording and the replay, which
+        is how it surfaced at all.
+
+        Writing over a file an ancestor produced is not a conflict; that is the
+        pipeline working. The conflict is between nodes with no dependency
+        relationship, because nothing orders them.
+        """
+        owner = context.get("path_owner", {}).get(path)
+        ancestors: dict[str, set[str]] = context.get("ancestors", {})
+
+        if owner and owner != node.id:
+            related = owner in ancestors.get(node.id, set()) or node.id in ancestors.get(owner, set())
+            if not related:
+                self.audit.emit(
+                    AuditEventType.POLICY_VIOLATION,
+                    {
+                        "rule": "orchestration.concurrent_write",
+                        "severity": "medium",
+                        "message": (
+                            f"{node.id!r} overwrote {path!r} previously written by "
+                            f"{owner!r}; neither depends on the other, so which "
+                            f"content survives depends on which finished last"
+                        ),
+                        "location": path,
+                    },
+                    node_id=node.id,
+                )
+                if self.view:
+                    self.view.note(f"concurrent write to {path}: {owner} then {node.id}")
+
+        context.setdefault("path_owner", {})[path] = node.id
+
+    def _persist(
+        self, node: NodeSpec, outcome: StageOutcome, context: dict[str, Any]
+    ) -> list[Artifact]:
         """Write file artifacts into the workspace so later stages can use them."""
         written: list[Artifact] = []
         for artifact in outcome.artifacts:
             if artifact.path:
+                self._check_write_conflict(node, artifact.path, context)
                 stored = self.workspace.write(artifact.path, artifact.content)
                 stored.produced_by = node.id
                 written.append(stored)

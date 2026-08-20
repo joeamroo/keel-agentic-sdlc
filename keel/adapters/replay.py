@@ -59,6 +59,15 @@ class ReplayAdapter:
     def __init__(self, cassettes: Mapping[str, dict], *, strict: bool = True) -> None:
         self.cassettes: dict[str, dict] = dict(cassettes)
         self.strict = strict
+        # Fallback index, consumed in recorded order per node.
+        self._by_node: dict[str, list[dict]] = {}
+        for payload in self.cassettes.values():
+            node_id = str(payload.get("node_id") or "")
+            if node_id:
+                self._by_node.setdefault(node_id, []).append(payload)
+        # Every fallback that fires, so the run can report them honestly rather
+        # than quietly serving a recording made for a different prompt.
+        self.drifted: list[str] = []
 
     # -- construction ------------------------------------------------------
 
@@ -77,6 +86,9 @@ class ReplayAdapter:
 
     async def invoke(self, request: AdapterRequest) -> AdapterResponse:
         cassette = self.cassettes.get(request.cassette_key)
+
+        if cassette is None:
+            cassette = self._by_node_fallback(request)
 
         if cassette is None:
             if self.strict:
@@ -104,6 +116,35 @@ class ReplayAdapter:
             latency_seconds=float(cassette.get("latency_seconds") or 0.0),
             from_replay=True,
         )
+
+    def _by_node_fallback(self, request: AdapterRequest) -> dict | None:
+        """Serve the next recording for this node when the exact key misses.
+
+        The primary key is a hash of the prompt, which is the strictest and
+        most honest match: it proves the replayed response was produced for
+        exactly this input. It is also brittle. Editing a stage prompt, or any
+        change to what the executor puts in a payload, shifts every downstream
+        key and invalidates a recording that is otherwise perfectly good.
+
+        So a miss falls back to the next unused recording for the same node, in
+        the order it was recorded. The response is still real model output from
+        a real run of this stage; it was simply produced from a slightly
+        different prompt. Every fallback is recorded on `drifted` and surfaced
+        by the CLI, because a replay that silently serves a mismatched
+        recording would be worse than one that fails loudly.
+        """
+        queue = self._by_node.get(request.node_id or "")
+        if not queue:
+            return None
+        for candidate in queue:
+            if candidate.get("_consumed"):
+                continue
+            if candidate.get("skill_id") and candidate["skill_id"] != request.skill_id:
+                continue
+            candidate["_consumed"] = True
+            self.drifted.append(request.node_id or "?")
+            return candidate
+        return None
 
     def _stub(self, request: AdapterRequest) -> AdapterResponse:
         """Obviously-fake response for non-strict mode.
@@ -199,7 +240,12 @@ def _cassettes_from_lines(lines: Iterable[str]) -> dict[str, dict]:
             continue
         key = payload.get("cassette_key")
         if isinstance(key, str) and key:
-            cassettes[key] = payload
+            entry = dict(payload)
+            # The node id lives on the event, not in the payload. Replay needs
+            # it to fall back by node when a prompt has drifted since
+            # recording, and dropping it here silently disabled that fallback.
+            entry.setdefault("node_id", event.get("node_id") or "")
+            cassettes[key] = entry
 
     return cassettes
 

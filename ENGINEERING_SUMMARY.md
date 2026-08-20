@@ -61,9 +61,15 @@ Two more came from other workstreams. Rewriting a generated module with same-len
 
 **Parallel stages diverged on what the design left open.** Implementation and test authoring run concurrently from the same design and never see each other's output. A live run produced a service reading `DATABASE_PATH` against a suite setting `LINKS_DB_PATH`, and after that was fixed, a disagreement about which status code an exhausted retry budget returns. Both stages were defensible each time; the design simply had not decided. The design schema now pins the configuration surface, and where a disagreement survives that, verification failure triggers a bounded repair rather than stopping the run.
 
+**Two concurrent stages wrote the same file.** `document` and `implement` both produced a README. Neither depends on the other, so the surviving content was whichever finished last, and it changed between the recording and its replay, which is the only reason it surfaced. Both stages succeeded and both gates passed; the workspace simply held one of two plausible answers. The executor now detects a write to a path owned by a node with no dependency relationship and records it.
+
+**A node read state it never declared a dependency on.** Test authoring built its prompt from whatever was on disk, which under concurrency depends on whether implementation had finished. That made its replay key unstable. Payloads are now derived from declared dependencies: a node sees generated code only if it depends on the stage that generates it, and otherwise sees the pre-run baseline.
+
 ## Trade-offs
 
 **Deterministic planning over generated planning.** A model-generated graph would look more autonomous. It would also differ between runs, which makes an audit trail nearly worthless and reproduction impossible. Judgement lives in the analysis; the topology follows by readable rules.
+
+**Replay falls back from exact-prompt matching to per-node matching.** The primary key is a hash of the prompt, which proves a replayed response was produced for exactly this input. It is also brittle: editing any stage prompt invalidates otherwise perfectly good recordings. A miss now falls back to the next unused recording for the same node and says so, in the CLI and on the run. The alternative was re-recording every scenario after every prompt edit, and a replay that silently served a mismatched recording would be worse than either.
 
 **Replay by default.** The repository is public and reviewers should not need an API key or a bill. Replay plays back real recorded model output, and the orchestration still executes for real against it. The cost is that a reader could mistake replay for simulation, which is why it is stated plainly in the README.
 

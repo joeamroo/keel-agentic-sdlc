@@ -171,6 +171,15 @@ async def _run(args: argparse.Namespace) -> int:
         mermaid=PlanGraph(result.plan).to_mermaid(),
     )
 
+    drifted = getattr(adapter, "drifted", None)
+    if drifted:
+        print(
+            f"\nnote: {len(drifted)} replayed response(s) were matched by node rather than "
+            f"by exact prompt, because the prompts have changed since recording "
+            f"({', '.join(sorted(set(drifted)))}). The responses are real recorded "
+            f"model output; re-record with --mode live for an exact replay."
+        )
+
     print(f"\nstate: {result.state.value}")
     if result.stopped_reason:
         print(f"reason: {result.stopped_reason}")

@@ -646,3 +646,79 @@ def test_change_control_still_blocks_a_node_nobody_approved(tmp_path):
 
     assert result.results["implement"].state is TaskState.REJECTED
     assert ws.list_files() == []
+
+
+def test_two_unrelated_nodes_writing_the_same_file_is_reported(tmp_path):
+    """Regression: concurrent stages silently clobbered each other.
+
+    `document` and `implement` both wrote README.md. They have no dependency
+    between them, so which content survived was whichever finished last. Both
+    stages succeeded, both gates passed, and the workspace held one of two
+    plausible answers with nothing recorded about it.
+    """
+    plan = Plan(
+        nodes=[
+            node("design", skill_id="design"),
+            node("writer-a", ["design"]),
+            node("writer-b", ["design"]),
+        ]
+    )
+    ex, disp, audit, ws = build(tmp_path, plan)
+
+    async def both_write_readme(node_id, skill_id, tier, payload):
+        if node_id == "design":
+            return ok()
+        return StageOutcome(
+            state=TaskState.COMPLETED,
+            artifacts=[
+                Artifact(
+                    name="README.md",
+                    content=f"written by {node_id}",
+                    produced_by=node_id,
+                    path="README.md",
+                )
+            ],
+            parsed={},
+        )
+
+    disp.dispatch = both_write_readme
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.COMPLETED
+    conflicts = [
+        e for e in audit.events()
+        if e.event_type is AuditEventType.POLICY_VIOLATION
+        and e.payload.get("rule") == "orchestration.concurrent_write"
+    ]
+    assert conflicts, "two unrelated nodes wrote the same path and nothing recorded it"
+    assert "README.md" in conflicts[0].payload["message"]
+
+
+def test_writing_over_a_dependency_output_is_not_a_conflict(tmp_path):
+    """A later stage revising an earlier one's file is the pipeline working."""
+    plan = Plan(nodes=[node("first"), node("second", ["first"])])
+    ex, disp, audit, _ = build(tmp_path, plan)
+
+    async def chain(node_id, skill_id, tier, payload):
+        return StageOutcome(
+            state=TaskState.COMPLETED,
+            artifacts=[
+                Artifact(
+                    name="app.py",
+                    content=f"# {node_id}",
+                    produced_by=node_id,
+                    path="app.py",
+                )
+            ],
+            parsed={},
+        )
+
+    disp.dispatch = chain
+    asyncio.run(ex.run(PROBLEM, plan))
+
+    conflicts = [
+        e for e in audit.events()
+        if e.event_type is AuditEventType.POLICY_VIOLATION
+        and e.payload.get("rule") == "orchestration.concurrent_write"
+    ]
+    assert not conflicts, "an ordered overwrite was reported as a race"

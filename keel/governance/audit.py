@@ -335,7 +335,12 @@ class AuditLog:
                 continue
             key = event.payload.get("cassette_key")
             if isinstance(key, str) and key and key not in found:
-                found[key] = dict(event.payload)
+                payload = dict(event.payload)
+                # The node id lives on the event rather than in the payload,
+                # but replay needs it to fall back when a prompt has drifted
+                # since recording, so carry it through.
+                payload.setdefault("node_id", event.node_id or "")
+                found[key] = payload
         return found
 
     # ------------------------------------------------------------------
