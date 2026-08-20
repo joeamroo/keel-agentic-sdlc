@@ -1,300 +1,373 @@
-"""Fixed-window rate limiting, enforced once in ASGI middleware.
+"""Sliding window rate limiting, enforced in one ASGI middleware.
 
-The middleware runs ahead of routing and body parsing, so a throttled request
-never opens a database connection and never has its body read.
+The middleware runs before routing, before body parsing and before any
+database connection is opened, so a throttled request costs almost nothing and
+can never leave a half written row.
 
-Two structurally identical but separate bucket maps are kept:
+Buckets are namespaced so a key bucket and an IP bucket can never alias:
 
-``ip_buckets``
-    keyed on a per-boot salted hash of the peer address, used for the anonymous
-    creation budget (``LINKS_RATE_LIMIT_MAX``) and for redirects
-    (``LINKS_RATE_LIMIT_MAX * REDIRECT_LIMIT_MULTIPLIER``).
+* ``post:key:<hash>`` - per API key creation quota (recognised keys only)
+* ``post:ip:<hash>``  - per client address creation quota
+* ``get:ip:<hash>``   - per client address read/redirect quota
 
-``api_key_buckets``
-    keyed on a per-boot salted hash of a recognised ``X-API-Key`` value, used
-    for that key's own creation quota.
-
-Each map is pruned independently at ``LINKS_MAX_TRACKED_KEYS`` entries, so API
-key traffic cannot evict per-IP buckets. Identities are never stored or logged
-in the clear: bucket ids are ``class:blake2s(boot_salt || value)[:16]``.
+All bucket identity is derived from a per-boot salted blake2b digest, so no
+raw API key and no raw client address is ever held in limiter state.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
-import re
 import secrets
 import threading
 import time
-from collections import OrderedDict
+from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    MutableMapping,
+    Optional,
+    Tuple,
+)
 
-from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+LOGGER = logging.getLogger("app.ratelimit")
 
-from .config import Settings
-from .errors import error_payload
-
-logger = logging.getLogger("app.ratelimit")
-
-# Redirects are far cheaper than creations and are shared by every visitor of a
-# link, so the redirect bucket is a large multiple of the creation budget.
-REDIRECT_LIMIT_MULTIPLIER = 100
-
-CREATE_PATH = "/api/links"
-BUCKET_CLASS_CREATE = "create"
-BUCKET_CLASS_CREATE_KEY = "create_key"
-BUCKET_CLASS_REDIRECT = "redirect"
-
+MAX_TRACKED_KEYS = 10000
+KEY_BUCKET_PREFIX = "post:key:"
+IP_CREATE_BUCKET_PREFIX = "post:ip:"
+IP_READ_BUCKET_PREFIX = "get:ip:"
+MAX_API_KEY_HEADER_BYTES = 512
 API_KEY_HEADER = b"x-api-key"
-MAX_API_KEY_HEADER_LENGTH = 256
 
-_REDIRECT_PATH_PATTERN = re.compile(r"^/[0-9A-Za-z_-]{1,64}$")
-_RESERVED_PATHS = frozenset({"/health", "/docs", "/redoc", "/openapi", "/favicon"})
+CATEGORY_CREATE = "create"
+CATEGORY_READ = "read"
+
+_UNLIMITED_GET_SEGMENTS = frozenset(
+    {"health", "docs", "redoc", "openapi.json", "favicon.ico"}
+)
+
+_RATE_LIMITED_BODY = json.dumps(
+    {
+        "error": {
+            "code": "rate_limited",
+            "message": "Rate limit exceeded. Please retry later.",
+        }
+    },
+    separators=(",", ":"),
+).encode("utf-8")
+
+Scope = MutableMapping[str, Any]
+Message = MutableMapping[str, Any]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Message], Awaitable[None]]
+ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 
-def _default_clock() -> float:
-    """Return the current monotonic time in seconds.
-
-    Looked up through the ``time`` module on every call so tests can patch it.
-    Raises nothing.
-    """
-    return time.monotonic()
-
-
-@dataclass(frozen=True)
+@dataclass
 class Decision:
-    """Outcome of a limiter check."""
+    """Outcome of a single limiter consultation."""
 
     allowed: bool
     retry_after: int
-    bucket_id: str
 
 
-@dataclass(frozen=True)
-class BucketPlan:
-    """Which bucket a request is charged to, and at what limit."""
+@dataclass
+class _Bucket:
+    """Sliding window counter for one namespaced bucket id."""
 
-    bucket_class: str
-    identity: str
-    limit: int
-    keyed: bool
+    hits: Deque[float]
+    allowance: int
+    last_seen: float
 
 
-class RateLimiterState:
-    """In-process fixed-window counters shared by every worker thread.
+def classify_request(method: str, path: str) -> Optional[str]:
+    """Decide which limiter category a request belongs to.
 
-    State is never serialised to SQLite, the WAL or any file.
+    Returns ``"create"`` for ``POST /api/links``, ``"read"`` for ``GET /{code}``
+    and ``GET /api/links/{code}/stats``, and ``None`` for everything else
+    (health checks and documentation are never limited).  Raises nothing.
     """
+    normalized = path.rstrip("/") or "/"
+    if method == "POST":
+        return CATEGORY_CREATE if normalized == "/api/links" else None
+    if method != "GET":
+        return None
+    segments = [segment for segment in normalized.split("/") if segment]
+    if len(segments) == 1 and segments[0] not in _UNLIMITED_GET_SEGMENTS:
+        return CATEGORY_READ
+    if (
+        len(segments) == 4
+        and segments[0] == "api"
+        and segments[1] == "links"
+        and segments[3] == "stats"
+    ):
+        return CATEGORY_READ
+    return None
 
-    def __init__(self, settings: Settings, clock: Optional[Callable[[], float]] = None) -> None:
-        """Create limiter state for a settings snapshot.
 
-        ``clock`` is an injectable monotonic time source (defaults to
-        ``time.monotonic``) so tests can advance the window without sleeping.
+def extract_api_key(headers: Iterable[Tuple[bytes, bytes]]) -> Optional[str]:
+    """Pull the ``X-API-Key`` header value out of a raw ASGI header list.
+
+    Header name matching is case-insensitive (ASGI lower-cases names); the
+    value is returned verbatim for exact, case-sensitive comparison.
+    Returns ``None`` when the header is absent, empty, longer than
+    ``MAX_API_KEY_HEADER_BYTES`` or not valid UTF-8.  Raises nothing.
+    """
+    for name, value in headers:
+        if name.lower() != API_KEY_HEADER:
+            continue
+        if not value or len(value) > MAX_API_KEY_HEADER_BYTES:
+            return None
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
+def client_host_of(scope: Scope) -> str:
+    """Return the peer address of a connection.
+
+    Only the transport level peer is used; forwarding headers are ignored
+    because a client can trivially forge them.  Returns ``"unknown"`` when the
+    server does not expose a client tuple.  Raises nothing.
+    """
+    client = scope.get("client")
+    if isinstance(client, (tuple, list)) and client:
+        host = client[0]
+        if host:
+            return str(host)
+    return "unknown"
+
+
+class RateLimiter:
+    """In-process sliding window limiter shared by every limited route."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        window_seconds: int,
+        create_max: int,
+        redirect_multiplier: int,
+        api_key_entries: Tuple[Tuple[str, int], ...] = (),
+    ) -> None:
+        """Build a limiter.
+
+        Hashes the configured API key names with a per-boot salt and discards
+        the plaintext immediately, so no credential survives in memory.
         Raises nothing.
         """
-        self.settings = settings
-        self.clock: Callable[[], float] = clock if clock is not None else _default_clock
+        self._enabled = bool(enabled)
+        self._window = float(max(1, window_seconds))
+        self._create_max = max(1, create_max)
+        self._read_max = max(1, create_max * max(1, redirect_multiplier))
+        self._salt = secrets.token_bytes(16)
         self._lock = threading.Lock()
-        self._boot_salt = secrets.token_bytes(16)
-        self.ip_buckets: "OrderedDict[str, Tuple[float, int]]" = OrderedDict()
-        self.api_key_buckets: "OrderedDict[str, Tuple[float, int]]" = OrderedDict()
+        self._buckets: Dict[str, _Bucket] = {}
+        quotas: Dict[str, int] = {}
+        for name, quota in api_key_entries:
+            if quota < 1:
+                continue
+            quotas[self.digest(name)] = int(quota)
+        self._key_quotas: Dict[str, int] = quotas
+        if quotas:
+            LOGGER.info("api key quotas loaded for %d key(s)", len(quotas))
 
-    def bucket_id(self, bucket_class: str, identity: str) -> str:
-        """Derive the opaque bucket id for an identity.
+    @property
+    def enabled(self) -> bool:
+        """Report whether limiting is active.
 
-        Returns ``class:digest`` where digest is a truncated blake2s over the
-        per-boot salt and the identity, so neither an API key nor a client
-        address can be recovered from limiter state or logs. Raises nothing.
+        Returns ``True`` when buckets are consulted.  Raises nothing.
         """
-        digest = hashlib.blake2s(
-            self._boot_salt + identity.encode("utf-8", "replace")
-        ).hexdigest()[:16]
-        return "%s:%s" % (bucket_class, digest)
+        return self._enabled
 
-    def _prune(self, buckets: "OrderedDict[str, Tuple[float, int]]") -> None:
-        """Evict least recently used entries beyond the configured cap.
+    @property
+    def window_seconds(self) -> float:
+        """Return the sliding window length in seconds.  Raises nothing."""
+        return self._window
 
-        Returns None. Raises nothing. Caller must hold the lock.
+    @property
+    def create_allowance(self) -> int:
+        """Return the per-IP creation allowance.  Raises nothing."""
+        return self._create_max
+
+    @property
+    def read_allowance(self) -> int:
+        """Return the per-IP read/redirect allowance.  Raises nothing."""
+        return self._read_max
+
+    def digest(self, value: str) -> str:
+        """Hash a credential or address with the per-boot salt.
+
+        Returns a 32 character hex digest.  Raises nothing.
         """
-        limit = self.settings.max_tracked_keys
-        while len(buckets) > limit:
-            buckets.popitem(last=False)
+        return hashlib.blake2b(
+            value.encode("utf-8", errors="replace"), salt=self._salt, digest_size=16
+        ).hexdigest()
 
-    def consume(self, plan: BucketPlan) -> Decision:
-        """Charge one request against the planned bucket.
+    def resolve_key(self, presented: Optional[str]) -> Optional[Tuple[str, int]]:
+        """Look up a presented API key value.
 
-        Returns a :class:`Decision`; when it is not allowed, ``retry_after`` is
-        a whole number of seconds in ``[1, window]``. Raises nothing.
+        Returns ``(key_hash, quota)`` when the key is recognised, otherwise
+        ``None`` - an unknown key is indistinguishable from no key at all.
+        Raises nothing.
         """
-        buckets = self.api_key_buckets if plan.keyed else self.ip_buckets
-        bucket_id = self.bucket_id(plan.bucket_class, plan.identity)
-        window = float(self.settings.rate_limit_window_seconds)
+        if presented is None or not self._key_quotas:
+            return None
+        key_hash = self.digest(presented)
+        quota = self._key_quotas.get(key_hash)
+        if quota is None:
+            return None
+        return key_hash, quota
+
+    def bucket_ids(self) -> Tuple[str, ...]:
+        """Return a snapshot of the currently tracked bucket ids.
+
+        Intended for diagnostics and tests only.  Raises nothing.
+        """
         with self._lock:
-            now = float(self.clock())
-            entry = buckets.get(bucket_id)
-            if entry is None or (now - entry[0]) >= window or (now - entry[0]) < 0:
-                buckets[bucket_id] = (now, 1)
-                buckets.move_to_end(bucket_id)
-                self._prune(buckets)
-                return Decision(True, 0, bucket_id)
-            window_start, count = entry
-            if count >= plan.limit:
-                remaining = window - (now - window_start)
-                retry_after = max(1, min(int(window), int(math.ceil(remaining))))
-                return Decision(False, retry_after, bucket_id)
-            buckets[bucket_id] = (window_start, count + 1)
-            buckets.move_to_end(bucket_id)
-            return Decision(True, 0, bucket_id)
+            return tuple(self._buckets.keys())
 
-    def advance(self, seconds: float) -> None:
-        """Pretend ``seconds`` have elapsed by rewinding every window start.
-
-        Intended for tests that must cross a window boundary without sleeping.
-        Returns None. Raises nothing.
-        """
+    def bucket_count(self) -> int:
+        """Return how many buckets are currently tracked.  Raises nothing."""
         with self._lock:
-            for buckets in (self.ip_buckets, self.api_key_buckets):
-                for bucket_id, (window_start, count) in list(buckets.items()):
-                    buckets[bucket_id] = (window_start - seconds, count)
+            return len(self._buckets)
 
     def reset(self) -> None:
         """Drop all counters.
 
-        Returns None. Raises nothing.
+        Returns ``None``.  Raises nothing.
         """
         with self._lock:
-            self.ip_buckets.clear()
-            self.api_key_buckets.clear()
+            self._buckets.clear()
+
+    def _evict_locked(self) -> None:
+        """Evict least recently seen IP buckets when the dict is full.
+
+        Key buckets are never evicted because their cardinality is bounded by
+        the configuration.  Must be called with the lock held.  Returns
+        ``None``.  Raises nothing.
+        """
+        if len(self._buckets) < MAX_TRACKED_KEYS:
+            return
+        evictable: List[Tuple[float, str]] = [
+            (bucket.last_seen, bucket_id)
+            for bucket_id, bucket in self._buckets.items()
+            if not bucket_id.startswith(KEY_BUCKET_PREFIX)
+        ]
+        if not evictable:
+            return
+        evictable.sort()
+        excess = len(self._buckets) - MAX_TRACKED_KEYS + 1
+        for _, bucket_id in evictable[:excess]:
+            self._buckets.pop(bucket_id, None)
+
+    def consume(self, bucket_id: str, allowance: int) -> Decision:
+        """Record one hit against a bucket if the allowance permits it.
+
+        Returns a :class:`Decision`; when it is not allowed, ``retry_after`` is
+        the whole number of seconds (rounded up, at least 1, never more than
+        the window) until the oldest recorded hit leaves the window.  A denied
+        request is not recorded, so denials never extend the window.
+        Raises nothing.
+        """
+        effective = max(1, allowance)
+        now = time.monotonic()
+        cutoff = now - self._window
+        with self._lock:
+            bucket = self._buckets.get(bucket_id)
+            if bucket is None:
+                self._evict_locked()
+                bucket = _Bucket(hits=deque(), allowance=effective, last_seen=now)
+                self._buckets[bucket_id] = bucket
+            bucket.allowance = effective
+            bucket.last_seen = now
+            while bucket.hits and bucket.hits[0] <= cutoff:
+                bucket.hits.popleft()
+            if len(bucket.hits) >= effective:
+                oldest = bucket.hits[0]
+                remaining = (oldest + self._window) - now
+                retry_after = int(math.ceil(remaining)) if remaining > 0 else 1
+                retry_after = max(1, min(retry_after, int(math.ceil(self._window))))
+                return Decision(allowed=False, retry_after=retry_after)
+            bucket.hits.append(now)
+            return Decision(allowed=True, retry_after=0)
+
+    def check_request(self, scope: Scope) -> Decision:
+        """Apply the limiter to one HTTP scope.
+
+        Chooses the per-key creation bucket for a recognised ``X-API-Key`` on
+        ``POST /api/links``, the per-IP creation bucket otherwise, and the
+        per-IP read bucket for redirect and stats requests.  Unlimited routes
+        always return an allowed decision.  Raises nothing.
+        """
+        if not self._enabled:
+            return Decision(allowed=True, retry_after=0)
+        method = str(scope.get("method", ""))
+        path = str(scope.get("path", "/"))
+        category = classify_request(method, path)
+        if category is None:
+            return Decision(allowed=True, retry_after=0)
+        if category == CATEGORY_CREATE:
+            headers = scope.get("headers") or []
+            resolved = self.resolve_key(extract_api_key(headers))
+            if resolved is not None:
+                key_hash, quota = resolved
+                return self.consume(KEY_BUCKET_PREFIX + key_hash, quota)
+            host_hash = self.digest(client_host_of(scope))
+            return self.consume(IP_CREATE_BUCKET_PREFIX + host_hash, self._create_max)
+        host_hash = self.digest(client_host_of(scope))
+        return self.consume(IP_READ_BUCKET_PREFIX + host_hash, self._read_max)
 
 
-def _header_value(scope: Scope, name: bytes) -> Optional[str]:
-    """Read a single request header from the raw ASGI scope.
+async def send_rate_limited(send: Send, retry_after: int) -> None:
+    """Emit the canned 429 response.
 
-    Returns the trimmed value of the first matching header, or None when the
-    header is absent or undecodable. Raises nothing.
+    Returns ``None``.  Raises whatever the ASGI ``send`` callable raises.
     """
-    for raw_name, raw_value in scope.get("headers") or ():
-        if raw_name == name:
-            try:
-                return raw_value.decode("latin-1").strip()
-            except (UnicodeDecodeError, AttributeError):
-                return None
-    return None
-
-
-def _client_identity(scope: Scope) -> str:
-    """Return the peer address used as the per-IP limiter identity.
-
-    Only the transport peer is used; forwarded headers are ignored because a
-    client can trivially forge them. Returns ``"unknown"`` when the server does
-    not expose a peer. Raises nothing.
-    """
-    client = scope.get("client")
-    if client and isinstance(client, (tuple, list)) and client[0]:
-        return str(client[0])
-    return "unknown"
-
-
-def _is_redirect_path(path: str) -> bool:
-    """Report whether a path is a short-code redirect path.
-
-    Returns True for single segment code-shaped paths that are not reserved
-    application paths. Raises nothing.
-    """
-    if not _REDIRECT_PATH_PATTERN.match(path):
-        return False
-    return path not in _RESERVED_PATHS
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(_RATE_LIMITED_BODY)).encode("ascii")),
+        (b"retry-after", str(max(1, retry_after)).encode("ascii")),
+        (b"cache-control", b"no-store"),
+    ]
+    await send({"type": "http.response.start", "status": 429, "headers": headers})
+    await send({"type": "http.response.body", "body": _RATE_LIMITED_BODY})
 
 
 class RateLimitMiddleware:
-    """ASGI middleware applying the creation and redirect rate limits."""
+    """Pure ASGI middleware enforcing every rate limit in one place."""
 
-    def __init__(self, app: ASGIApp, state: RateLimiterState) -> None:
-        """Wrap ``app`` with the limiter backed by ``state``.
+    def __init__(self, app: ASGIApp, limiter: RateLimiter) -> None:
+        """Wrap an ASGI application with the limiter.
 
         Raises nothing.
         """
         self.app = app
-        self.state = state
-
-    def plan(self, scope: Scope) -> Optional[BucketPlan]:
-        """Decide which bucket, if any, this request is charged to.
-
-        Creation requests presenting a recognised ``X-API-Key`` are charged
-        solely to that key's bucket at that key's quota; every other creation
-        request is charged to the per-IP creation bucket. Redirects are always
-        charged to the per-IP redirect bucket. Returns None for requests that
-        are not rate limited (health, stats, docs, everything else). Raises
-        nothing.
-        """
-        settings = self.state.settings
-        method = scope.get("method", "")
-        path = scope.get("path", "")
-        if method == "POST" and path == CREATE_PATH:
-            quotas = settings.api_key_quotas
-            if quotas:
-                presented = _header_value(scope, API_KEY_HEADER)
-                if (
-                    presented
-                    and len(presented) <= MAX_API_KEY_HEADER_LENGTH
-                    and presented in quotas
-                ):
-                    return BucketPlan(
-                        bucket_class=BUCKET_CLASS_CREATE_KEY,
-                        identity=presented,
-                        limit=int(quotas[presented]),
-                        keyed=True,
-                    )
-            return BucketPlan(
-                bucket_class=BUCKET_CLASS_CREATE,
-                identity=_client_identity(scope),
-                limit=settings.rate_limit_max,
-                keyed=False,
-            )
-        if method in ("GET", "HEAD") and _is_redirect_path(path):
-            return BucketPlan(
-                bucket_class=BUCKET_CLASS_REDIRECT,
-                identity=_client_identity(scope),
-                limit=settings.rate_limit_max * REDIRECT_LIMIT_MULTIPLIER,
-                keyed=False,
-            )
-        return None
+        self.limiter = limiter
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Apply the limit and either forward the request or answer with 429.
+        """Handle one ASGI event stream.
 
-        Returns None. Raises whatever the wrapped application raises.
+        Consults the limiter before routing and body parsing; on refusal emits
+        a 429 with ``Retry-After`` and ``Cache-Control: no-store`` and never
+        calls the wrapped application.  Returns ``None``.  Raises whatever the
+        wrapped application raises.
         """
-        if scope.get("type") != "http" or not self.state.settings.rate_limit_enabled:
+        if scope.get("type") != "http" or not self.limiter.enabled:
             await self.app(scope, receive, send)
             return
-
-        plan = self.plan(scope)
-        if plan is None:
-            await self.app(scope, receive, send)
+        decision = self.limiter.check_request(scope)
+        if not decision.allowed:
+            await send_rate_limited(send, decision.retry_after)
             return
-
-        decision = self.state.consume(plan)
-        logger.debug(
-            "rate limit check bucket=%s allowed=%s", decision.bucket_id, decision.allowed
-        )
-        if decision.allowed:
-            await self.app(scope, receive, send)
-            return
-
-        response = JSONResponse(
-            status_code=429,
-            content=error_payload(
-                "rate_limited", "Rate limit exceeded. Please retry later."
-            ),
-            headers={
-                "Retry-After": str(decision.retry_after),
-                "Cache-Control": "no-store",
-            },
-        )
-        await response(scope, receive, send)
+        await self.app(scope, receive, send)

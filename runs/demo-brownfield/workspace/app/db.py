@@ -1,99 +1,78 @@
-"""SQLite access layer.
+"""SQLite persistence for links and clicks.
 
-The schema is frozen: ``SCHEMA_STATEMENTS`` defines exactly two tables and one
-index, and nothing in this service writes client addresses or API keys to disk.
-Every statement is parameterised; no SQL is ever built by string formatting.
+Every statement is parameterized; no SQL is ever built by string formatting.
+The schema is frozen: ``links`` and ``clicks`` only.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from typing import Iterator, Optional, Tuple
+
+LOGGER = logging.getLogger("app.db")
+
+CONNECT_TIMEOUT_SECONDS = 5.0
 
 SCHEMA_STATEMENTS: Tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS links (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT NOT NULL UNIQUE,
-        target_url TEXT NOT NULL,
+        url TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        expires_at TEXT,
-        click_count INTEGER NOT NULL DEFAULT 0,
-        last_clicked_at TEXT
+        expires_at TEXT
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS clicks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        link_id INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
+        link_id INTEGER NOT NULL,
         clicked_at TEXT NOT NULL,
-        referrer TEXT,
-        user_agent TEXT
+        FOREIGN KEY (link_id) REFERENCES links (id)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_clicks_link_id ON clicks(link_id)",
+    "CREATE INDEX IF NOT EXISTS idx_clicks_link_id ON clicks (link_id)",
 )
-
-MAX_TEXT_FIELD_LENGTH = 512
-
-
-def ensure_parent_directory(db_path: str) -> None:
-    """Create the directory holding the SQLite file when it does not exist.
-
-    Does nothing for in-memory databases or paths without a directory part.
-    Returns None. Raises OSError when the directory cannot be created.
-    """
-    if db_path == ":memory:" or db_path.startswith("file:"):
-        return
-    parent = os.path.dirname(os.path.abspath(db_path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
 
 
 @contextmanager
 def connect(db_path: str) -> Iterator[sqlite3.Connection]:
-    """Open a SQLite connection configured for WAL and foreign keys.
+    """Open a SQLite connection for the duration of the context.
 
-    Yields the connection and always closes it. Raises sqlite3.Error when the
-    database cannot be opened or configured.
+    Yields a connection in autocommit mode with ``sqlite3.Row`` rows and
+    foreign keys enabled, and always closes it.
+    Raises :class:`sqlite3.Error` when the database cannot be opened.
     """
-    conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
+    conn = sqlite3.connect(
+        db_path, timeout=CONNECT_TIMEOUT_SECONDS, isolation_level=None
+    )
     try:
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         yield conn
     finally:
         conn.close()
 
 
-@contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Run a block inside an immediate SQLite transaction.
-
-    Yields the connection, commits on success and rolls back on any exception.
-    Raises whatever the wrapped block raises, including sqlite3.IntegrityError.
-    """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    conn.execute("COMMIT")
-
-
 def init_db(db_path: str) -> None:
-    """Create the schema if it is missing.
+    """Create the database file and the frozen schema if they do not exist.
 
-    Returns None. Raises sqlite3.Error when the schema cannot be applied and
-    OSError when the parent directory cannot be created.
+    Returns ``None``.
+    Raises :class:`OSError` when the parent directory cannot be created and
+    :class:`sqlite3.Error` when the schema cannot be applied.
     """
-    ensure_parent_directory(db_path)
+    directory = os.path.dirname(os.path.abspath(db_path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     with connect(db_path) as conn:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.Error:
+            LOGGER.warning("could not enable WAL journal mode; continuing")
         for statement in SCHEMA_STATEMENTS:
             conn.execute(statement)
 
@@ -101,63 +80,66 @@ def init_db(db_path: str) -> None:
 def insert_link(
     conn: sqlite3.Connection,
     code: str,
-    target_url: str,
+    url: str,
     created_at: str,
     expires_at: Optional[str],
 ) -> int:
-    """Insert a new link row.
+    """Insert one link row.
 
-    Returns the new row id. Raises sqlite3.IntegrityError when ``code``
-    collides with an existing row (the UNIQUE constraint is the only place code
-    uniqueness is enforced).
-    """
-    with transaction(conn):
-        cursor = conn.execute(
-            "INSERT INTO links (code, target_url, created_at, expires_at, click_count, "
-            "last_clicked_at) VALUES (?, ?, ?, ?, 0, NULL)",
-            (code, target_url, created_at, expires_at),
-        )
-        row_id = cursor.lastrowid
-    return int(row_id or 0)
-
-
-def fetch_link(conn: sqlite3.Connection, code: str) -> Optional[sqlite3.Row]:
-    """Look up a single link by its short code.
-
-    Returns the row, or None when no link with that code exists. Raises
-    sqlite3.Error on database failure.
+    Returns the new row id.
+    Raises :class:`sqlite3.IntegrityError` when the code already exists and
+    :class:`sqlite3.Error` for any other database failure.
     """
     cursor = conn.execute(
-        "SELECT id, code, target_url, created_at, expires_at, click_count, last_clicked_at "
-        "FROM links WHERE code = ?",
+        "INSERT INTO links (code, url, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (code, url, created_at, expires_at),
+    )
+    return int(cursor.lastrowid or 0)
+
+
+def fetch_link_by_code(conn: sqlite3.Connection, code: str) -> Optional[sqlite3.Row]:
+    """Look up one link by its short code.
+
+    Returns the row, or ``None`` when no link has that code.
+    Raises :class:`sqlite3.Error` on a database failure.
+    """
+    cursor = conn.execute(
+        "SELECT id, code, url, created_at, expires_at FROM links WHERE code = ?",
         (code,),
     )
-    return cursor.fetchone()
+    row = cursor.fetchone()
+    return row
 
 
-def record_click(
-    conn: sqlite3.Connection,
-    link_id: int,
-    clicked_at: str,
-    referrer: Optional[str],
-    user_agent: Optional[str],
-) -> None:
-    """Record a redirect: bump the counter and append to the click log.
+def record_click(conn: sqlite3.Connection, link_id: int, clicked_at: str) -> None:
+    """Record one served redirect.
 
-    Deliberately stores no client address and no API key. Returns None. Raises
-    sqlite3.Error on database failure.
+    Returns ``None``.
+    Raises :class:`sqlite3.Error` on a database failure.
     """
-    with transaction(conn):
-        conn.execute(
-            "UPDATE links SET click_count = click_count + 1, last_clicked_at = ? WHERE id = ?",
-            (clicked_at, link_id),
-        )
-        conn.execute(
-            "INSERT INTO clicks (link_id, clicked_at, referrer, user_agent) VALUES (?, ?, ?, ?)",
-            (
-                link_id,
-                clicked_at,
-                referrer[:MAX_TEXT_FIELD_LENGTH] if referrer is not None else None,
-                user_agent[:MAX_TEXT_FIELD_LENGTH] if user_agent is not None else None,
-            ),
-        )
+    conn.execute(
+        "INSERT INTO clicks (link_id, clicked_at) VALUES (?, ?)",
+        (link_id, clicked_at),
+    )
+
+
+def fetch_click_stats(
+    conn: sqlite3.Connection, link_id: int
+) -> Tuple[int, Optional[str]]:
+    """Aggregate the clicks recorded for one link.
+
+    Returns ``(total_clicks, last_clicked_at)`` where the second element is
+    ``None`` when the link was never visited.
+    Raises :class:`sqlite3.Error` on a database failure.
+    """
+    cursor = conn.execute(
+        "SELECT COUNT(*) AS total, MAX(clicked_at) AS last_clicked_at "
+        "FROM clicks WHERE link_id = ?",
+        (link_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return 0, None
+    total = int(row["total"] or 0)
+    last = row["last_clicked_at"]
+    return total, (str(last) if last is not None else None)

@@ -1,20 +1,17 @@
 """Typed request and response models validated at the HTTP boundary.
 
-The request model runs in pydantic strict mode: values of the wrong type are
-rejected rather than coerced, and unknown fields are refused.
+Request models run in pydantic strict mode with ``extra='forbid'`` so invalid
+input is rejected rather than coerced, and every string that can reach the
+database carries a length limit.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
-# Absolute ceiling for the url field. The per-deployment limit
-# (LINKS_MAX_URL_LENGTH) is applied on top of this in the route and can only be
-# smaller, so nothing longer than this ever reaches the database.
-MAX_URL_FIELD_LENGTH = 8192
-MAX_TTL_FIELD_VALUE = 1_000_000_000
+MAX_URL_LENGTH = 2048
 
 
 class CreateLinkRequest(BaseModel):
@@ -22,44 +19,47 @@ class CreateLinkRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    url: str = Field(
-        ...,
-        min_length=1,
-        max_length=MAX_URL_FIELD_LENGTH,
-        description="Absolute http or https target URL.",
-    )
-    ttl_seconds: Optional[int] = Field(
-        default=None,
-        ge=0,
-        le=MAX_TTL_FIELD_VALUE,
-        description="Lifetime in seconds. 0 or omitted uses the configured default.",
-    )
+    url: StrictStr = Field(min_length=1, max_length=MAX_URL_LENGTH)
+    expires_in_seconds: Optional[StrictInt] = Field(default=None, ge=1)
 
 
-class CreateLinkResponse(BaseModel):
-    """Body of a successful ``POST /api/links``."""
+class LinkCreatedResponse(BaseModel):
+    """Successful ``POST /api/links`` response."""
 
     code: str
     short_url: str
-    target_url: str
+    url: str
     created_at: str
     expires_at: Optional[str] = None
 
 
-class StatsResponse(BaseModel):
-    """Body of ``GET /api/links/{code}/stats``."""
+class LinkStatsResponse(BaseModel):
+    """Successful ``GET /api/links/{code}/stats`` response."""
 
     code: str
-    target_url: str
+    url: str
     created_at: str
     expires_at: Optional[str] = None
-    click_count: int
+    expired: bool = False
+    clicks: int = 0
     last_clicked_at: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
-    """Body of ``GET /health``."""
+    """Successful ``GET /health`` response."""
 
     status: str
-    service: str
     time: str
+
+
+class ErrorBody(BaseModel):
+    """Inner object of the error envelope."""
+
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    """The single error shape returned by every failing request."""
+
+    error: ErrorBody

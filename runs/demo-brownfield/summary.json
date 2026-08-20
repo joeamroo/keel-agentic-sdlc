@@ -13,65 +13,70 @@
     "scenario_detected": "brownfield",
     "ambiguities": [
       {
-        "question": "Should a key's quota window be a fixed 60 seconds, or should it follow LINKS_RATE_LIMIT_WINDOW_SECONDS like the per-IP limiter?",
-        "why": "It decides whether the key bucket carries its own hard-coded 60-second window (and a Retry-After capped at 60) or reuses settings.rate_limit_window_seconds, which changes both the limiter code path and the upper bound asserted on Retry-After.",
-        "blocking": false
-      },
-      {
-        "question": "Does a request carrying a known key also consume the per-IP creation budget, or only the key budget?",
-        "why": "If both apply, a key with quota 100 is still capped at LINKS_RATE_LIMIT_MAX=10 per address and the feature is useless; if only the key applies, the middleware must skip the IP bucket for keyed creations.",
+        "question": "Should the per-key window be a fixed 60 seconds, or should it follow LINKS_RATE_LIMIT_WINDOW_SECONDS like the per-IP limiter?",
+        "why": "Determines whether the key bucket reads settings.rate_limit_window_seconds or hardcodes 60, and therefore what Retry-After can return when an operator sets a non-default window.",
         "blocking": false
       },
       {
         "question": "Does LINKS_RATE_LIMIT_ENABLED=false also disable per-key limiting?",
-        "why": "It determines whether the key check sits inside or outside the existing early-return guard in RateLimitMiddleware.__call__.",
+        "why": "Decides whether the middleware short-circuits before key resolution or still enforces key quotas while IP limiting is off; changes test fixtures that currently disable the limiter wholesale.",
         "blocking": false
       },
       {
-        "question": "How should malformed or duplicate entries in SHORTENER_API_KEYS be handled?",
-        "why": "Decides whether the process refuses to start, silently drops the bad pair, or clamps the quota, and what the parser returns for 'alpha' with no colon, 'beta:abc', 'gamma:0' and a repeated name.",
+        "question": "Should a known-key request also count against the caller's per-IP creation bucket (both limits applied)?",
+        "why": "Applying both would make a quota of 100 unreachable behind the default per-IP limit of 10, negating the feature; applying only the key quota changes the bucket selection to be exclusive.",
         "blocking": false
       },
       {
-        "question": "Should the 429 response add informational rate-limit headers (X-RateLimit-Limit / -Remaining) alongside Retry-After?",
-        "why": "Adds headers to the response contract that clients may start depending on and that tests would need to pin.",
+        "question": "What does a quota of 0 or a negative quota mean for a listed key?",
+        "why": "Determines whether 'alpha:0' blocks every creation with 429 or is discarded so alpha falls back to the per-IP limit.",
+        "blocking": false
+      },
+      {
+        "question": "If SHORTENER_API_KEYS lists the same key name twice with different quotas, which wins?",
+        "why": "Fixes the parser semantics and the resulting quota an operator gets from a typo'd configuration.",
+        "blocking": false
+      },
+      {
+        "question": "Is the redirect bucket's shared key namespace acceptable, i.e. may key-derived buckets live in the same _hits map as address-derived buckets?",
+        "why": "Affects whether a separate map is needed for eviction fairness under MAX_TRACKED_KEYS pressure; a shared map lets a burst of addresses evict key state.",
         "blocking": false
       }
     ]
   },
   "run": {
     "state": "failed",
-    "stopped_reason": "implement failed: APIStatusError: {'type': 'error', 'error': {'details': None, 'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CeDt2rPX24AkSzP2G28FB'}",
+    "stopped_reason": "implement failed: ReadTimeout: ",
     "plan_version": 1,
     "plan_revisions": 0,
     "nodes": {
       "impact-analysis": {
         "state": "completed",
-        "attempts": 2,
+        "attempts": 1,
         "rolled_back": false,
         "used_fallback": false,
-        "duration": 207.17
+        "duration": 114.78
       },
       "design": {
         "state": "completed",
-        "attempts": 3,
+        "attempts": 1,
         "rolled_back": false,
-        "used_fallback": true,
-        "duration": 466.927
+        "used_fallback": false,
+        "duration": 149.535
       },
       "author-tests": {
         "state": "completed",
         "attempts": 1,
         "rolled_back": false,
         "used_fallback": false,
-        "duration": 487.914
+        "duration": 251.971
       },
       "document": {
         "state": "completed",
         "attempts": 1,
         "rolled_back": false,
         "used_fallback": false,
-        "duration": 27.375
+        "duration": 27.418
       },
       "implement": {
         "state": "failed",
@@ -87,16 +92,16 @@
     "total_nodes": 5,
     "succeeded": 4,
     "failed": 1,
-    "retries": 3,
+    "retries": 0,
     "rollbacks": 0,
-    "fallbacks": 1,
+    "fallbacks": 0,
     "approvals_requested": 2,
     "plan_revisions": 0,
-    "e2e_latency_seconds": 1236.9995279312134,
-    "mttr_seconds": 209.51272535324097,
-    "cost_usd": 3.296469,
-    "input_tokens": 176600,
-    "output_tokens": 104357,
+    "e2e_latency_seconds": 19282.634130001068,
+    "mttr_seconds": null,
+    "cost_usd": 1.640938,
+    "input_tokens": 125201,
+    "output_tokens": 48473,
     "success_rate": 0.8
   }
 }

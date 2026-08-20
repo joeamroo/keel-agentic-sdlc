@@ -1,85 +1,96 @@
-"""SSRF surface: loopback, private and link local targets never get stored."""
+"""SSRF surface: loopback, private, link local and metadata targets."""
 import pytest
 
-from conftest import assert_error
+from conftest import assert_error_envelope
 
-BLOCKED = [
-    ("cloud_metadata", "http://169.254.169.254/latest/meta-data/"),
-    ("link_local", "http://169.254.10.1/x"),
-    ("loopback_v4", "http://127.0.0.1:8080/admin"),
-    ("loopback_v6", "http://[::1]/x"),
-    ("loopback_decimal", "http://2130706433/x"),
-    ("private_10", "http://10.0.0.7/x"),
-    ("private_172", "http://172.16.5.4/x"),
-    ("private_192", "http://192.168.1.1/router"),
-    ("unique_local_v6", "http://[fd00::1]/x"),
-    ("unspecified", "http://0.0.0.0/x"),
+LOOPBACK = [
+    "http://127.0.0.1/x",
+    "http://127.5.5.5/x",
+    "http://[::1]/x",
+    "http://[::ffff:127.0.0.1]/x",
+]
+
+PRIVATE_OR_RESERVED = [
+    "http://10.0.0.1/x",
+    "http://172.16.0.5/x",
+    "http://192.168.1.1/x",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://100.64.0.1/x",
+    "http://0.0.0.0/x",
+    "http://[fd00::1]/x",
+    "http://[fe80::1]/x",
 ]
 
 
-@pytest.mark.parametrize("label,target", BLOCKED, ids=[b[0] for b in BLOCKED])
-def test_a_private_or_link_local_literal_is_rejected_and_writes_no_row(app, label, target):
+@pytest.mark.parametrize("target", LOOPBACK)
+def test_loopback_literal_is_rejected_with_blocked_destination_and_writes_no_row(app, target):
     response = app.create(target)
 
-    assert response.status_code == 400, (
-        "{0} target {1!r} produced {2}: {3}".format(
-            label, target, response.status_code, response.text[:200]
-        )
-    )
-    error = assert_error(response)
+    assert response.status_code == 400, (target, response.status_code, response.text[:200])
+    error = assert_error_envelope(response)
     assert error["code"] == "blocked_destination", error
-    assert app.link_rows() == [], "a blocked destination left a row behind"
+    assert app.link_rows() == []
 
 
-def test_the_cloud_metadata_address_is_blocked_behind_a_hostname_too(app, fake_dns):
+@pytest.mark.parametrize("target", PRIVATE_OR_RESERVED)
+def test_private_or_reserved_literal_is_rejected_with_blocked_destination_and_writes_no_row(app, target):
+    response = app.create(target)
+
+    assert response.status_code == 400, (target, response.status_code, response.text[:200])
+    error = assert_error_envelope(response)
+    assert error["code"] == "blocked_destination", error
+    assert app.link_rows() == []
+
+
+def test_the_cloud_metadata_address_is_blocked_even_behind_a_hostname(app, fake_dns):
     fake_dns.set("metadata.internal.test", ["169.254.169.254"])
 
     response = app.create("http://metadata.internal.test/latest/meta-data/")
 
-    assert response.status_code == 400, response.text[:200]
-    assert assert_error(response)["code"] == "blocked_destination"
-    assert app.link_count() == 0
-    assert "metadata.internal.test" in fake_dns.lookups, (
-        "the host was never resolved, so it cannot have been denylist checked"
-    )
+    assert response.status_code == 400, response.text
+    assert assert_error_envelope(response)["code"] == "blocked_destination"
+    assert app.link_rows() == []
 
 
-def test_a_hostname_resolving_to_loopback_is_rejected_and_writes_no_row(app, fake_dns):
+def test_hostname_resolving_to_loopback_is_rejected_and_writes_no_row(app, fake_dns):
     fake_dns.set("evil.test", ["127.0.0.1"])
 
     response = app.create("https://evil.test/x")
 
-    assert response.status_code == 400, response.text[:200]
-    assert assert_error(response)["code"] == "blocked_destination"
-    assert app.link_count() == 0
+    assert response.status_code == 400, response.text
+    assert assert_error_envelope(response)["code"] == "blocked_destination"
+    assert app.link_rows() == []
+    assert "evil.test" in fake_dns.lookups, (
+        "the service never resolved the hostname, so it cannot have denylist-checked it"
+    )
 
 
-def test_a_hostname_with_one_private_address_among_public_ones_is_rejected(app, fake_dns):
+def test_hostname_with_one_blocked_address_among_several_is_rejected(app, fake_dns):
     fake_dns.set("mixed.test", ["93.184.216.34", "10.0.0.5"])
 
     response = app.create("https://mixed.test/x")
 
-    assert response.status_code == 400, response.text[:200]
-    assert assert_error(response)["code"] == "blocked_destination"
-    assert app.link_count() == 0
+    assert response.status_code == 400, response.text
+    assert assert_error_envelope(response)["code"] == "blocked_destination"
+    assert app.link_rows() == []
 
 
-def test_an_unresolvable_hostname_fails_closed_and_writes_no_row(app, fake_dns):
+def test_unresolvable_hostname_fails_closed_and_writes_no_row(app, fake_dns):
     fake_dns.fail("nowhere.invalid")
 
     response = app.create("https://nowhere.invalid/x")
 
-    assert response.status_code == 400, response.text[:200]
-    assert assert_error(response)["code"] == "blocked_destination"
-    assert app.link_count() == 0
+    assert response.status_code == 400, response.text
+    assert assert_error_envelope(response)["code"] == "blocked_destination"
+    assert app.link_rows() == []
 
 
-def test_public_addresses_are_still_accepted(app, fake_dns):
-    fake_dns.set("good.test", ["93.184.216.34"])
+def test_public_destinations_are_still_accepted_so_the_filter_is_not_deny_everything(app, fake_dns):
+    fake_dns.set("good.test", ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"])
 
     literal = app.create("http://93.184.216.34/x")
     named = app.create("https://good.test/x")
 
-    assert literal.status_code == 201, literal.text[:200]
-    assert named.status_code == 201, named.text[:200]
-    assert app.link_count() == 2
+    assert literal.status_code == 201, literal.text
+    assert named.status_code == 201, named.text
+    assert len(app.link_rows()) == 2

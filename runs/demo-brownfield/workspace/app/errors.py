@@ -1,64 +1,74 @@
-"""Stable error envelope helpers.
+"""One stable error envelope for every failure the service reports.
 
-Every error the service emits has the shape
-``{"error": {"code": "...", "message": "..."}}``. No stack trace, database error
-string or filesystem path ever reaches a client.
+Error bodies always look like ``{"error": {"code": ..., "message": ...}}`` and
+never contain a stack trace, a database error string or a filesystem path.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional
+from typing import Dict
 
-from fastapi.responses import JSONResponse
+_STATUS_TO_CODE: Dict[int, str] = {
+    400: "invalid_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+    422: "invalid_request",
+    429: "rate_limited",
+    500: "internal_error",
+    503: "service_unavailable",
+}
 
-MAX_MESSAGE_LENGTH = 500
+_DEFAULT_MESSAGES: Dict[int, str] = {
+    400: "The request was invalid.",
+    404: "The requested resource does not exist.",
+    405: "The HTTP method is not allowed for this resource.",
+    422: "The request body failed validation.",
+    429: "Rate limit exceeded. Please retry later.",
+    500: "An internal error occurred.",
+    503: "The service is temporarily unavailable.",
+}
 
 
-class AppError(Exception):
-    """Application level error carrying an HTTP status and a stable error code."""
+class ApiError(Exception):
+    """An error that maps directly onto the public error envelope."""
 
-    def __init__(
-        self,
-        status_code: int,
-        code: str,
-        message: str,
-        headers: Optional[Mapping[str, str]] = None,
-    ) -> None:
-        """Create an error.
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        """Create an API error.
 
-        ``status_code`` is the HTTP status, ``code`` the stable machine readable
-        identifier, ``message`` a safe human readable description and
-        ``headers`` optional extra response headers. Raises nothing.
+        Stores the HTTP status, the stable machine readable code and a safe
+        human readable message.  Raises nothing.
         """
         super().__init__(message)
         self.status_code = status_code
         self.code = code
-        self.message = message[:MAX_MESSAGE_LENGTH]
-        self.headers: Optional[Dict[str, str]] = dict(headers) if headers else None
+        self.message = message
+
+
+def status_error_code(status_code: int) -> str:
+    """Map an HTTP status code onto a stable error code.
+
+    Returns the mapped code, or 'error' for statuses without a mapping.
+    Raises nothing.
+    """
+    return _STATUS_TO_CODE.get(status_code, "error")
+
+
+def default_error_message(status_code: int) -> str:
+    """Return a safe default message for an HTTP status code.
+
+    Returns a generic sentence that leaks no internal detail.  Raises nothing.
+    """
+    return _DEFAULT_MESSAGES.get(status_code, "The request could not be completed.")
 
 
 def error_payload(code: str, message: str) -> Dict[str, Dict[str, str]]:
-    """Build the error envelope body.
+    """Build the JSON-serialisable error envelope.
 
-    Returns the dictionary that is serialised as the JSON error response.
-    Raises nothing.
+    Returns ``{"error": {"code": code, "message": message}}``.  Raises nothing.
     """
-    return {"error": {"code": code, "message": message[:MAX_MESSAGE_LENGTH]}}
-
-
-def error_response(
-    status_code: int,
-    code: str,
-    message: str,
-    headers: Optional[Mapping[str, str]] = None,
-) -> JSONResponse:
-    """Build a JSON error response using the stable envelope.
-
-    Returns a :class:`JSONResponse` with the given status, envelope body and
-    optional headers. Raises nothing.
-    """
-    return JSONResponse(
-        status_code=status_code,
-        content=error_payload(code, message),
-        headers=dict(headers) if headers else None,
-    )
+    return {"error": {"code": code, "message": message}}

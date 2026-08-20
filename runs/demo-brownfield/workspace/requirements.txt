@@ -1,10 +1,6 @@
-# Runtime dependencies (pinned exactly as required by the design).
 fastapi==0.115.6
 starlette==0.41.3
 pydantic==2.10.4
 uvicorn==0.32.1
-
-# Test-time tooling. starlette.testclient requires httpx at import time; the
-# service itself imports neither of these packages.
 httpx==0.28.1
 pytest==8.3.4

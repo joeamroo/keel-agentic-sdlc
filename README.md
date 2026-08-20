@@ -89,8 +89,17 @@ implementation that genuinely modified the generated code (it added
 It is also the only recording that shows the **repair loop firing on real
 work**. Verification ran the generated suite, the suite failed, and rather than
 stopping the run discarded the implementation and began regenerating it with the
-failing transcript in hand. The API budget funding the run ran out during that
-regeneration, so the recording ends mid-repair.
+failing transcript in hand. The recording ends mid-repair, when the connection
+to the API timed out.
+
+An earlier attempt at this scenario failed differently and is worth knowing
+about, because it was an orchestration bug rather than a model one. Test
+authoring inherited twelve test files from the greenfield workspace, wrote
+eleven more beside them under different names, and replaced the shared
+conftest. The inherited tests were not wrong; they were running against
+fixtures that no longer existed, and the implementation was then asked to
+satisfy two suites written against two designs. In this recording the stage
+returns a single file, extending the existing suite, which is the fix working.
 
 That makes it a partial run rather than a green one, and it is committed as
 evidence rather than as a demo. `keel run --scenario brownfield --mode live`
