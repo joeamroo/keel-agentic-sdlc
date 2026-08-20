@@ -39,7 +39,7 @@ from keel.models import (
     Plan,
     TaskState,
 )
-from keel.planner import VERIFY, Planner
+from keel.planner import IMPLEMENT, VERIFY, Planner
 
 if TYPE_CHECKING:  # imported for typing only, so the engine stays unit-testable
     from keel.governance.approvals import ApprovalBroker
@@ -58,6 +58,7 @@ class RunResult:
     state: TaskState = TaskState.WORKING
     stopped_reason: str = ""
     plan_revisions: int = 0
+    repairs: int = 0
     pending_questions: list[str] = field(default_factory=list)
 
     @property
@@ -83,6 +84,7 @@ class Executor:
         planner: Planner | None = None,
         view: LiveView | None = None,
         max_plan_revisions: int = 3,
+        max_repairs: int = 2,
     ):
         self.run_id = run_id
         self.dispatcher = dispatcher
@@ -94,6 +96,7 @@ class Executor:
         self.planner = planner or Planner()
         self.view = view
         self.max_plan_revisions = max_plan_revisions
+        self.max_repairs = max_repairs
 
         # Set this to stop cleanly at the next node boundary. Cancelling
         # mid-node would be a worse guarantee than finishing the node and
@@ -151,6 +154,8 @@ class Executor:
                         result.state = TaskState.INPUT_REQUIRED
                         result.pending_questions.append(outcome.error or "input required")
                         raise SafeStop(f"{node.id} needs human input")
+                    elif self._repair(node, outcome, context, result, completed):
+                        continue
                     else:
                         raise SafeStop(f"{node.id} failed: {outcome.error}")
 
@@ -252,6 +257,11 @@ class Executor:
 
             if outcome.state is not TaskState.COMPLETED:
                 result.error = outcome.message or "stage failed"
+                # Keep what a failed stage produced. For the verification node
+                # that is the pytest transcript, which is the only evidence a
+                # repair has to work from. Dropping it on failure meant the
+                # repair prompt carried the instruction and none of the detail.
+                result.artifacts = list(outcome.artifacts)
                 last_failure = result.error
                 continue
 
@@ -390,6 +400,10 @@ class Executor:
             "review": _as_text(outputs.get("review")),
             "review_findings": _as_text(outputs.get("review")),
         }
+        repair_note = context.get("repair_note")
+        if repair_note and node.id == IMPLEMENT:
+            payload["requirement"] += f"\n\n{repair_note}"
+
         if last_failure:
             payload["requirement"] += (
                 "\n\nA previous attempt at this stage was rejected by the quality gate. "
@@ -487,6 +501,79 @@ class Executor:
             node_id=node.id,
         )
         return decision.approved
+
+    def _repair(
+        self,
+        node: NodeSpec,
+        outcome: NodeResult,
+        context: dict[str, Any],
+        result: RunResult,
+        completed: set[str],
+    ) -> bool:
+        """Try to fix failed verification instead of stopping the run.
+
+        A failing test suite is evidence, not a verdict. Implementation and
+        test authoring run concurrently from the same design and never see each
+        other's output, so they can disagree on anything the design left open.
+        A live run disagreed on which status code an exhausted retry budget
+        returns and on whether a client may set `created_at`. Both stages were
+        defensible; the design simply had not decided.
+
+        Node-level retry cannot fix that, because re-running verification
+        re-runs pytest against unchanged code. The repair has to reach back up
+        the graph: discard the implementation, hand it the failing transcript,
+        and verify again.
+
+        The tests are treated as the specification and the implementation is
+        what moves. That is a choice, and the defensible one here: the suite was
+        written from the design and encodes the acceptance criteria, so letting
+        the implementation rewrite its own oracle would be marking its own work.
+
+        Returns True when a repair was scheduled, False to let the run stop.
+        """
+        if node.id != VERIFY:
+            return False
+        if result.repairs >= self.max_repairs:
+            return False
+        if IMPLEMENT not in result.results:
+            return False
+
+        transcript = "\n".join(a.content for a in outcome.artifacts).strip()
+        if not transcript:
+            transcript = outcome.error or "the test suite failed with no captured output"
+        transcript = transcript[:6000]
+        result.repairs += 1
+        context["repair_note"] = (
+            "The generated test suite was run against your previous implementation "
+            "and it failed. The tests are the specification here, so change the "
+            "implementation to satisfy them rather than changing the tests. "
+            f"This is repair attempt {result.repairs} of {self.max_repairs}.\n\n"
+            f"{transcript}"
+        )
+
+        # Discard the implementation and the verification so the scheduler
+        # offers them again. Everything else keeps its result, so documentation
+        # and test authoring are not regenerated for a fault they did not cause.
+        for node_id in (IMPLEMENT, VERIFY):
+            result.results.pop(node_id, None)
+            completed.discard(node_id)
+
+        self.audit.emit(
+            AuditEventType.REPAIR_STARTED,
+            {
+                "attempt": result.repairs,
+                "limit": self.max_repairs,
+                "trigger": "verification failed",
+                "re_running": [IMPLEMENT, VERIFY],
+            },
+            node_id=node.id,
+        )
+        if self.view:
+            self.view.note(
+                f"verification failed, repairing implementation "
+                f"(attempt {result.repairs} of {self.max_repairs})"
+            )
+        return True
 
     def _maybe_replan(
         self, graph: PlanGraph, context: dict[str, Any], result: RunResult

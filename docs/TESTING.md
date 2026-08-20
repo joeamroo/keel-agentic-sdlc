@@ -2,7 +2,7 @@
 
 ## What is tested, and why there
 
-There are 602 tests, but the split across layers matters more than the count.
+There are 610 tests, but the split across layers matters more than the count.
 
 | Layer | What it covers | Why it lives there |
 | --- | --- | --- |

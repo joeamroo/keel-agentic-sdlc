@@ -412,6 +412,7 @@ class AuditEventType(str, Enum):
     RETRY = "retry"
     FALLBACK = "fallback"
     ROLLBACK = "rollback"
+    REPAIR_STARTED = "repair_started"
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_DECIDED = "approval_decided"
     SAFE_STOP = "safe_stop"

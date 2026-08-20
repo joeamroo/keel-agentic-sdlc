@@ -66,6 +66,18 @@ Around each node:
               bounded retry -> fallback -> rollback -> safe stop
 ```
 
+Node-level retry handles a stage that failed on its own terms. It cannot handle
+two stages that disagree, because re-running one of them in isolation changes
+nothing. That case is repaired at the graph level instead:
+
+```
+  verify fails
+      -> discard the implementation and the verification
+      -> re-run implementation with the failing transcript
+      -> verify again
+      (bounded; the stages that did not fail keep their results)
+```
+
 Approval comes before the entry gate on purpose. Asking a person to sign off on work whose preconditions have not been checked wastes their attention, and attention is the scarce resource in a human-in-the-loop system.
 
 ## The plan graph
@@ -92,6 +104,21 @@ The topology is a diamond, and that is not decoration. `implement`, `author-test
 
 **Cost routing is per node.** Each node declares the tier it needs. Analysis, design, implementation, tests and review get Opus 5, because each one is a decision that later stages encode. Documentation and release checks get Haiku 4.5, because the facts are already in the artifacts by then. Per-stage cost lands in the metrics so the choice can be checked against the bill.
 
+**A failing test suite is evidence, not a verdict.** When verification fails,
+the run repairs rather than stopping. The implementation is discarded and
+regenerated with the failing transcript in hand, then verified again, bounded
+to two attempts. The tests are treated as the specification and the
+implementation is what moves, because the suite was written from the design and
+encodes the acceptance criteria; letting the implementation rewrite its own
+oracle would be marking its own work.
+
+This exists because of a real failure. Implementation and test authoring run
+concurrently from the same design and never see each other's output, so they can
+disagree about anything the design left open. A live run disagreed on which
+status code an exhausted retry budget returns and on whether a client may set
+`created_at`. Both stages were defensible. The design simply had not decided,
+and no amount of node-level retry could have resolved it.
+
 **Everything a node touches is snapshotted first.** A stage that fails halfway through writing six files leaves the workspace in a state no later stage was designed for. Restoring is cheaper and more honest than compensating.
 
 **Approval fails closed.** Empty input, EOF or an unrecognised answer all deny. For a high-impact change in a regulated environment, silence is not consent.
@@ -104,7 +131,7 @@ The topology is a diamond, and that is not decoration. `implement`, `author-test
 | Sequential and parallel paths with synchronization | `executor.py` ready-set scheduler |
 | Cross-stage context and decision lineage | `governance/lineage.py` |
 | Human approval checkpoints | `governance/approvals.py`, A2A `input_required` |
-| Bounded retries | `RetryPolicy` per node |
+| Bounded retries | `RetryPolicy` per node, plus a graph-level repair loop |
 | Fallback | alternate tier and strategy hint on final attempt |
 | Rollback | `workspace.py` snapshot and restore |
 | Safe-stop controls | `Executor.request_stop`, A2A `tasks/cancel` |

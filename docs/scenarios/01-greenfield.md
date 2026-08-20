@@ -42,6 +42,8 @@ The `verify` node is the point of the scenario. It runs `pytest` as a subprocess
 
 Two things back that up. A policy rule rejects a claimed pass with no transcript, so a stage cannot satisfy the gate by asserting the suite is green. And `test_a_failing_generated_suite_fails_the_run` in `tests/test_e2e.py` proves the gate can say no, because a gate that cannot fail is decoration.
 
+**Repair when verification fails.** If the generated suite fails, the run discards the implementation, regenerates it with the failing transcript, and verifies again, bounded to two attempts. Look for `repair_started` in the audit log. The stages that did not fail keep their results, so documentation and the test suite are not regenerated for a fault they did not cause.
+
 ## Evidence
 
 ```

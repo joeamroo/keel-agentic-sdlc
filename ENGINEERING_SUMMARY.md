@@ -19,7 +19,7 @@ Section 4.4 is one long paragraph containing twelve distinct requirements. I tre
 | Artifact | Where |
 | --- | --- |
 | Orchestrator | `keel/` |
-| Test suite | `tests/`, 602 tests |
+| Test suite | `tests/`, 610 tests |
 | Generated service | `runs/<run_id>/workspace/` |
 | Audit trail | `runs/<run_id>/audit.jsonl` |
 | Run report | `runs/<run_id>/report.html` |
@@ -59,6 +59,8 @@ Most of these came from live runs rather than from the suite, which is the hones
 
 Two more came from other workstreams. Rewriting a generated module with same-length content within the same second let CPython reuse a stale `.pyc`, so **pytest reported a pass on code that fails**, which is precisely the shape of the retry loop and the worst possible failure in a verification gate. And the metrics table transposed rows with a bare `zip`, so a single short row would have dropped a column from the whole table.
 
+**Parallel stages diverged on what the design left open.** Implementation and test authoring run concurrently from the same design and never see each other's output. A live run produced a service reading `DATABASE_PATH` against a suite setting `LINKS_DB_PATH`, and after that was fixed, a disagreement about which status code an exhausted retry budget returns. Both stages were defensible each time; the design simply had not decided. The design schema now pins the configuration surface, and where a disagreement survives that, verification failure triggers a bounded repair rather than stopping the run.
+
 ## Trade-offs
 
 **Deterministic planning over generated planning.** A model-generated graph would look more autonomous. It would also differ between runs, which makes an audit trail nearly worthless and reproduction impossible. Judgement lives in the analysis; the topology follows by readable rules.
@@ -87,6 +89,8 @@ Stated rather than hidden.
 - **MTTR is undefined when nothing has failed**, and reported as such. Zero would assert instant recovery, which is a different claim from never having been asked to recover.
 - **Cassettes are per requirement.** Changing a scenario's wording invalidates its recording, and the run must be re-recorded live.
 - **The generated service is not production software.** It is honest output from a real pipeline, held to the policy gates, and it is a demonstration rather than a thing to deploy.
+
+**Repair over halt on failed verification.** A failing suite could reasonably stop the run and hand it to a person. It repairs instead, bounded to two attempts, because the common cause is two concurrent stages disagreeing about something their shared design left unspecified, and a human would resolve that the same way: keep the tests, change the code. The risk is a system that grinds against its own oracle, which is why the budget is small and every attempt is in the audit log.
 
 ## What I would do next
 

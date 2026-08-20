@@ -49,7 +49,9 @@ keel run --scenario brownfield   # add rate limiting to what greenfield built
 keel run --scenario ambiguous    # "make the links more secure"
 ```
 
-**Greenfield** exercises decomposition and parallelism. Implementation, test authoring and documentation all depend only on the design, so they run concurrently, and verification is a real synchronization barrier that actually executes pytest against the generated code. The exit code is recorded verbatim. Nothing claims a passing test suite it did not run.
+**Greenfield** exercises decomposition, parallelism and self-repair. Implementation, test authoring and documentation all depend only on the design, so they run concurrently, and verification is a real synchronization barrier that actually executes pytest against the generated code. The exit code is recorded verbatim. Nothing claims a passing test suite it did not run.
+
+If the suite fails, the run does not stop there. It discards the implementation, regenerates it with the failing transcript in hand, and verifies again, bounded to two attempts. That path exists because implementation and test authoring run concurrently and can disagree about anything the design left open, which no amount of retrying a single stage can fix.
 
 **Brownfield** exercises codebase reasoning and change control. It reads what greenfield produced, identifies the impacted modules and routes, and because it modifies a public API surface it stops for my approval before writing anything. If impact analysis contradicts the original plan, the planner emits a new plan version rather than mutating the old one, and the audit log shows both.
 
@@ -109,7 +111,7 @@ The critical differentiator, and the twelve requirements in that paragraph each 
 | Sequential and parallel paths with synchronization | ready-set scheduler; `verify` is the barrier |
 | Cross-stage context and decision lineage | `keel/governance/lineage.py` |
 | Human approval checkpoints | `keel/governance/approvals.py`, A2A `input_required` |
-| Bounded retries | `RetryPolicy` per node, with the gate's reasons fed back |
+| Bounded retries | `RetryPolicy` per node, plus a bounded graph-level repair when verification fails |
 | Fallback | alternate tier and strategy on the final attempt |
 | Rollback | `keel/workspace.py`, scoped to the failing node's own writes |
 | Safe-stop controls | `Executor.request_stop`, A2A `tasks/cancel` |
@@ -149,7 +151,7 @@ Agents run multi-step work; a human holds the boundary. High-impact nodes need s
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q                # 602 tests
+.venv/bin/python -m pytest -q                # 610 tests
 .venv/bin/python -m pytest -q -m "not http"  # skip the ones that bind ports
 .venv/bin/ruff check keel/ tests/ --select F,B,E9
 ```

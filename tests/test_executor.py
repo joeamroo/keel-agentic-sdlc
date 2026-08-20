@@ -438,3 +438,130 @@ def test_run_is_bookended_in_the_audit_log(tmp_path):
     assert kinds[0] is AuditEventType.RUN_STARTED
     assert kinds[-1] is AuditEventType.RUN_FINISHED
     assert AuditEventType.PLAN_CREATED in kinds
+
+
+# --------------------------------------------------------------------------
+# Repair loop: a failing test suite is evidence, not a verdict
+# --------------------------------------------------------------------------
+
+from keel.planner import IMPLEMENT, VERIFY  # noqa: E402
+
+
+def _repair_plan() -> Plan:
+    """The real shape: implement and author-tests in parallel, verify joins."""
+    return Plan(
+        nodes=[
+            node("design", skill_id="design"),
+            node(IMPLEMENT, ["design"]),
+            node("author-tests", ["design"], kind=StageKind.TEST, skill_id="test"),
+            node("document", ["design"], kind=StageKind.DOCUMENT, skill_id="document"),
+            node(
+                VERIFY,
+                [IMPLEMENT, "author-tests"],
+                kind=StageKind.TEST,
+                skill_id="test",
+                retry=RetryPolicy(max_attempts=0),
+            ),
+        ]
+    )
+
+
+def _failing_then_passing_verify(tmp_path, fail_times: int, max_repairs: int = 2):
+    """Verify fails `fail_times`, then passes. Returns (result, dispatcher, audit)."""
+    plan = _repair_plan()
+    ex, disp, audit, _ = build(tmp_path, plan)
+    ex.max_repairs = max_repairs
+
+    state = {"verify_calls": 0}
+    prompts: list[str] = []
+
+    async def dispatch(node_id, skill_id, tier, payload):
+        disp.calls.append((node_id, tier))
+        if node_id == IMPLEMENT:
+            prompts.append(payload["requirement"])
+        return ok()
+
+    # The verify node never reaches the dispatcher: the executor runs real
+    # pytest for it. Stub that seam instead, so the test drives the outcome
+    # without needing a generated service on disk.
+    def fake_verify():
+        state["verify_calls"] += 1
+        if state["verify_calls"] <= fail_times:
+            return StageOutcome(
+                state=TaskState.FAILED,
+                message="pytest exited 1",
+                artifacts=[
+                    Artifact(
+                        name="verify.txt",
+                        content="FAILED test_expiry.py::test_created_at_is_ignored",
+                        produced_by=VERIFY,
+                    )
+                ],
+            )
+        return StageOutcome(state=TaskState.COMPLETED, parsed={"passed": True})
+
+    disp.dispatch = dispatch
+    ex._verify = fake_verify
+    result = asyncio.run(ex.run(PROBLEM, plan))
+    return result, disp, audit, prompts, state
+
+
+def test_failed_verification_repairs_the_implementation_and_re_verifies(tmp_path):
+    """The whole point: the run recovers instead of stopping at the gate."""
+    result, disp, audit, prompts, state = _failing_then_passing_verify(tmp_path, fail_times=1)
+
+    assert result.state is TaskState.COMPLETED, result.stopped_reason
+    assert result.repairs == 1
+    assert state["verify_calls"] == 2, "verification did not run again after the repair"
+    assert disp.count(IMPLEMENT) == 2, "the implementation was not regenerated"
+    assert any(e.event_type is AuditEventType.REPAIR_STARTED for e in audit.events())
+
+
+def test_the_repaired_implementation_is_given_the_failing_transcript(tmp_path):
+    """A repair that does not say what failed is just a re-roll at full cost."""
+    _, _, _, prompts, _ = _failing_then_passing_verify(tmp_path, fail_times=1)
+
+    assert len(prompts) == 2
+    assert "test_created_at_is_ignored" not in prompts[0], "the first attempt was pre-poisoned"
+    assert "test_created_at_is_ignored" in prompts[1], (
+        "the repaired attempt was not told which test failed"
+    )
+    assert "tests are the specification" in prompts[1]
+
+
+def test_repair_does_not_regenerate_stages_that_did_not_fail(tmp_path):
+    """Documentation and test authoring are not at fault, so they are not redone."""
+    _, disp, _, _, _ = _failing_then_passing_verify(tmp_path, fail_times=1)
+
+    assert disp.count("author-tests") == 1, "the test suite was rewritten to fit the code"
+    assert disp.count("document") == 1
+    assert disp.count("design") == 1
+
+
+def test_repair_is_bounded_and_the_run_stops_when_it_runs_out(tmp_path):
+    """Unbounded self-repair is an infinite loop that bills by the token."""
+    result, disp, audit, _, state = _failing_then_passing_verify(
+        tmp_path, fail_times=99, max_repairs=2
+    )
+
+    assert result.state is TaskState.FAILED
+    assert result.repairs == 2
+    # One original attempt plus two repairs.
+    assert state["verify_calls"] == 3
+    assert disp.count(IMPLEMENT) == 3
+    assert "verify failed" in result.stopped_reason
+
+
+def test_a_failure_that_is_not_verification_does_not_trigger_a_repair(tmp_path):
+    """Repair is scoped to the one failure it can actually address."""
+    plan = Plan(nodes=[node("design", skill_id="design"), node(IMPLEMENT, ["design"])])
+    ex, disp, audit, _ = build(
+        tmp_path, plan, {"design": [ok()], IMPLEMENT: [fail("model refused")]}
+    )
+    ex.max_repairs = 2
+
+    result = asyncio.run(ex.run(PROBLEM, plan))
+
+    assert result.state is TaskState.FAILED
+    assert result.repairs == 0
+    assert not any(e.event_type is AuditEventType.REPAIR_STARTED for e in audit.events())

@@ -194,6 +194,7 @@
         <mxCell id="d6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#2E7D32;" edge="1" parent="1" source="n_verify" target="n_review"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="d7" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#2E7D32;" edge="1" parent="1" source="n_review" target="n_release"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="d8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#2E7D32;" edge="1" parent="1" source="n_doc" target="n_release"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="d10" value="repair: re-run with the&#10;failing transcript (bounded)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#E65100;dashed=1;fontSize=9;fontColor=#E65100;exitX=0.5;exitY=0;entryX=1;entryY=0.5;" edge="1" parent="1" source="n_verify" target="n_impl"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="515" y="490" /><mxPoint x="400" y="490" /></Array></mxGeometry></mxCell>
         <mxCell id="d9" value="inserted on re-plan" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#C62828;dashed=1;fontSize=9;fontColor=#C62828;" edge="1" parent="1" source="n_seam" target="n_impl"><mxGeometry relative="1" as="geometry" /></mxCell>
 
         <mxCell id="x1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#616E7C;" edge="1" parent="1" source="e_approve" target="e_entry"><mxGeometry relative="1" as="geometry" /></mxCell>
