@@ -311,6 +311,26 @@ def _is_code(artifact: Artifact) -> bool:
     return bool(_CODE_MARKER.search(artifact.content))
 
 
+def _is_test_artifact(artifact: Artifact) -> bool:
+    """True for a file that exists to exercise other code.
+
+    A test fixture that drops its own temporary table is doing teardown, not
+    destroying anything anyone will miss. The same statement in application
+    code is a different act entirely, so the distinction is worth drawing
+    rather than flagging both at CRITICAL and training people to ignore the
+    rule.
+    """
+    name = (artifact.path or artifact.name or "").replace("\\", "/")
+    tail = name.rsplit("/", 1)[-1]
+    return (
+        name.startswith("tests/")
+        or "/tests/" in name
+        or tail.startswith("test_")
+        or tail.endswith("_test.py")
+        or tail == "conftest.py"
+    )
+
+
 def _guarded(content: str, marker: re.Pattern[str], action: re.Pattern[str]) -> bool:
     """A guard is a marker and a decision on the same line, not a bare mention."""
     return any(
@@ -514,8 +534,13 @@ class DestructiveOperationRule:
                     f"rmtree({_excerpt(target)})",
                 )
 
-            for match in _DROP_OBJECT.finditer(content):
-                flag(match.start(), f"schema destruction: {_excerpt(match.group(0))}")
+            # Schema teardown inside a test file is fixture hygiene. A live
+            # run blocked a generated suite at CRITICAL for `DROP TABLE links`
+            # in its own temporary database, which is the rule punishing
+            # correct work in the same way the open-redirect rule once did.
+            if not _is_test_artifact(artifact):
+                for match in _DROP_OBJECT.finditer(content):
+                    flag(match.start(), f"schema destruction: {_excerpt(match.group(0))}")
 
             for match in _TRUNCATE.finditer(content):
                 flag(match.start(), f"table truncation: {_excerpt(match.group(0))}")

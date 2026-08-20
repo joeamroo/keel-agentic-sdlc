@@ -783,3 +783,36 @@ def test_a_redirect_with_no_guard_anywhere_is_still_flagged() -> None:
     assert violations, "an unguarded redirect passed the rule"
     assert any("scheme" in v.message for v in violations)
     assert any("internal hosts" in v.message for v in violations)
+
+
+def test_schema_teardown_in_a_test_file_is_not_flagged() -> None:
+    """Regression: a generated suite was blocked for dropping its own table.
+
+    A live run produced a fixture that ran `DROP TABLE links` against its own
+    temporary database, which is ordinary teardown, and the rule denied it at
+    CRITICAL. That is the rule punishing correct work.
+    """
+    fixture = (
+        "import sqlite3\n"
+        "def reset(conn):\n"
+        "    conn.execute('DROP TABLE links')\n"
+    )
+    for name in ("tests/test_expiry.py", "tests/conftest.py", "test_links.py"):
+        artifact = art(fixture, name=name, produced_by="author-tests")
+        artifact.path = name
+        assert DestructiveOperationRule().evaluate([artifact], node("author-tests")) == [], (
+            f"{name} was flagged for its own fixture teardown"
+        )
+
+
+def test_schema_destruction_in_application_code_is_still_critical() -> None:
+    """The distinction is where the statement lives, not that it stopped mattering."""
+    app = (
+        "def migrate(conn):\n"
+        "    conn.execute('DROP TABLE links')\n"
+    )
+    artifact = art(app, name="app/db.py", produced_by="implement")
+    artifact.path = "app/db.py"
+    violations = DestructiveOperationRule().evaluate([artifact], node("implement"))
+    assert violations, "application code dropping a table was not flagged"
+    assert violations[0].severity is Severity.CRITICAL
