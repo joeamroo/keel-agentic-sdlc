@@ -7,6 +7,8 @@ more than the positive ones: a guardrail that cries wolf gets switched off.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from keel.governance.policy import (
@@ -870,3 +872,70 @@ def test_the_same_weak_secret_in_application_code_is_still_flagged() -> None:
     violations = SecretScanRule().evaluate([_app_file('secret = "s3cret-abc123"')], node())
     assert violations
     assert violations[0].severity is Severity.CRITICAL
+
+
+def test_a_design_document_describing_a_redirect_is_not_redirect_handling() -> None:
+    """Regression: the design stage was denied three times for its own document.
+
+    A stage's structured output is JSON. The design document described the
+    redirect endpoint, contained no guard because a document implements
+    nothing, and the rule read it as unguarded redirect handling.
+    """
+    design = json.dumps(
+        {
+            "endpoints": [
+                {
+                    "method": "GET",
+                    "path": "/{code}",
+                    # A bare "return" is what makes prose look like code to the
+                    # heuristic, and it is what the real design document
+                    # contained. A fixture without it does not reproduce the bug.
+                    "behaviour": "look up the code and return a 302 to the target",
+                }
+            ],
+            "redirect_status_code": 302,
+            "decisions": ["302 keeps analytics working and lets a bad link be killed"],
+            # Verbatim from the run this regression comes from. The redirect
+            # marker is call-shaped, and a config constant named
+            # REDIRECT_LIMIT_MULTIPLIER followed by a paren reads as a redirect
+            # call. Inventing prose about redirects does not reproduce it.
+            "configuration": [
+                {
+                    "name": "LINKS_RATE_LIMIT_MAX",
+                    "purpose": (
+                        "The 'redirect' bucket allows LINKS_RATE_LIMIT_MAX * "
+                        "REDIRECT_LIMIT_MULTIPLIER (module constant 100)."
+                    ),
+                }
+            ],
+        }
+    )
+    for name in ("design.json", "analyze.json", "README.md"):
+        artifact = art(design, name=name, produced_by="design")
+        artifact.path = name
+        artifact.media_type = "application/json" if name.endswith(".json") else "text/markdown"
+        assert OpenRedirectRule().evaluate([artifact], node("design")) == [], name
+
+    # The executor also builds dependency artifacts named `<node>.json` while
+    # leaving the media type at its default, so the name alone has to be
+    # enough. Asserting only the media-type path would leave this uncovered.
+    plain = art(design, name="design.json", produced_by="design")
+    plain.path = "design.json"
+    assert plain.media_type not in ("application/json", "text/markdown")
+    assert OpenRedirectRule().evaluate([plain], node("design")) == [], (
+        "a .json artifact with a default media type was still read as code"
+    )
+
+
+def test_an_unguarded_redirect_in_real_source_is_still_flagged() -> None:
+    """Excluding documents must not excuse the code they describe."""
+    src = (
+        "from fastapi.responses import RedirectResponse\n"
+        "def follow(code):\n"
+        "    return RedirectResponse(lookup(code))\n"
+    )
+    artifact = art(src, name="app/main.py", produced_by="implement")
+    artifact.path = "app/main.py"
+    assert OpenRedirectRule().evaluate([artifact], node("implement")), (
+        "an unguarded redirect in source was excused"
+    )

@@ -314,7 +314,20 @@ _CODE_MARKER = re.compile(
 )
 
 
+# Data and prose artifacts, whatever they happen to contain. A stage's
+# structured output is JSON and a README is markdown; both routinely describe
+# code without being code. A live run denied the design stage three times
+# because its design document described a redirect endpoint and did not also
+# implement an SSRF guard, which is not something a design document does.
+_NON_CODE_SUFFIXES = (".json", ".md", ".markdown", ".txt", ".rst", ".yaml", ".yml", ".toml")
+
+
 def _is_code(artifact: Artifact) -> bool:
+    name = artifact.path or artifact.name or ""
+    if name.endswith(_NON_CODE_SUFFIXES):
+        return False
+    if artifact.media_type in ("application/json", "text/markdown"):
+        return False
     if artifact.path and artifact.path.endswith(_CODE_SUFFIXES):
         return True
     if artifact.name.endswith(_CODE_SUFFIXES):
