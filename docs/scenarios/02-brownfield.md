@@ -51,12 +51,26 @@ Look for `approval_requested`, `approval_decided` and `plan_revised` in `runs/<r
 
 ## What the committed recording contains
 
-The recording stops after implementation, because the API credit funding it ran
-out mid-run. Everything unique to this scenario is in there: impact analysis
-over the existing service, the plan taking its brownfield shape, the approval
-request and decision, and an implementation that really modified the generated
-code rather than rewriting it. Test authoring, verification, review and the
-release check are absent. Re-record with `--mode live`.
+Read it as a debugging artifact rather than as a passing run.
+
+Everything unique to this scenario is there: impact analysis over the existing
+service, the plan taking its brownfield shape, the approval request and
+decision, and an implementation that really modified the generated code rather
+than rewriting it.
+
+Then it fails, twice, and both failures were real bugs it surfaced. The
+verification node was rejected at its entry gate for an unguarded redirect that
+did not exist, because the gate was handed a JSON summary of its upstream's
+output truncated to 12k characters: the redirect handler fell inside the
+summary and the SSRF guard was cut off. The repair loop then fired twice
+against that rejection, regenerating an implementation that had not caused it.
+
+Both are fixed and regression tested. The recording predates the fix because
+the API budget funding it ran out first, so it does not replay to completion.
+Re-record with `--mode live`.
+
+That is the argument for an audit log, incidentally. Neither bug was visible
+from the outside: the run simply failed. Both were obvious from the trail.
 
 ## Honest limit
 

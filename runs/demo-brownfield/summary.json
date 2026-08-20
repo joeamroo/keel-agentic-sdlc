@@ -1,0 +1,81 @@
+{
+  "run_id": "demo-brownfield",
+  "scenario": "brownfield",
+  "requirement": "Add per-API-key rate limiting to the existing URL shortener.\n\nKeys come from the environment, not from the database. The variable SHORTENER_API_KEYS holds a comma-separated list of key:quota pairs, so a key named alpha with a quota of 100 and a key named beta with a quota of 20 are written as two such pairs. The quota is requests per minute for link creation. There is no admin surface and no schema change; an unknown key is treated as no key.\n\nA caller presents its key in an X-API-Key header. A request carrying a known key is limited against that key's quota. A request with no key, or an unknown one, keeps the existing per-IP limit exactly as it behaves today, so existing clients continue to work unchanged.\n\nA caller over its quota receives HTTP 429 with a Retry-After header giving whole seconds until the window resets.\n\nThis change is additive. The existing per-IP throttle on redirects stays exactly as it is; do not remove or weaken it. Per-key limiting applies only to link creation, and redirects are never limited by key.",
+  "demonstrates": [
+    "codebase reasoning: impacted modules, routes and data flows",
+    "change control: modifying a public surface requires human approval",
+    "dynamic re-planning when analysis contradicts the original plan"
+  ],
+  "intake": {
+    "state": "completed",
+    "confidence": 0.86,
+    "scenario_detected": "brownfield",
+    "ambiguities": [
+      {
+        "question": "Is the per-key window fixed at 60 seconds, or does it reuse the configurable LINKS_RATE_LIMIT_WINDOW_SECONDS (default 60)?",
+        "why": "If an operator sets LINKS_RATE_LIMIT_WINDOW_SECONDS=30, a reused window makes 'alpha:100' mean 100 per 30s while a fixed window keeps it 100 per 60s; it also decides whether Retry-After can exceed the configured window and how tests can exercise expiry without sleeping a minute.",
+        "blocking": false
+      },
+      {
+        "question": "Does a request with a known key also count against, and get rejected by, the existing per-IP creation bucket?",
+        "why": "If both buckets apply, an alpha key with quota 100 is still capped at LINKS_RATE_LIMIT_MAX=10 per IP and the feature is inert at default configuration; if only the key bucket applies, the key genuinely raises the ceiling.",
+        "blocking": false
+      },
+      {
+        "question": "How should unusable entries in SHORTENER_API_KEYS be treated \u2014 skipped, or fatal?",
+        "why": "Determines whether a typo such as 'beta:xx' or a duplicate key name silently drops one key or refuses to start the service, and whether 'gamma:0' means block-all or invalid.",
+        "blocking": false
+      },
+      {
+        "question": "Does LINKS_RATE_LIMIT_ENABLED=false also disable per-key limiting?",
+        "why": "Decides whether test and dev deployments that set the flag can still be throttled by key, and whether the existing kill switch remains a single master switch.",
+        "blocking": false
+      },
+      {
+        "question": "Should the 429 (or the 201) carry advisory X-RateLimit-Limit/Remaining/Reset headers for keyed callers?",
+        "why": "Adds response headers to the create contract that clients may begin to depend on and that would need documenting; omitting keeps the contract identical apart from Retry-After.",
+        "blocking": false
+      }
+    ]
+  },
+  "run": {
+    "state": "failed",
+    "stopped_reason": "design failed: APIStatusError: {'type': 'error', 'error': {'details': None, 'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CeDawtJVar2iNe6Lx1yJo'}",
+    "plan_version": 1,
+    "plan_revisions": 0,
+    "nodes": {
+      "impact-analysis": {
+        "state": "completed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 108.144
+      },
+      "design": {
+        "state": "failed",
+        "attempts": 1,
+        "rolled_back": false,
+        "used_fallback": false,
+        "duration": 0.0
+      }
+    }
+  },
+  "metrics": {
+    "run_id": "demo-brownfield",
+    "total_nodes": 2,
+    "succeeded": 1,
+    "failed": 1,
+    "retries": 0,
+    "rollbacks": 0,
+    "fallbacks": 0,
+    "approvals_requested": 0,
+    "plan_revisions": 0,
+    "e2e_latency_seconds": 186.25777006149292,
+    "mttr_seconds": null,
+    "cost_usd": 0.42184,
+    "input_tokens": 40803,
+    "output_tokens": 8713,
+    "success_rate": 0.5
+  }
+}

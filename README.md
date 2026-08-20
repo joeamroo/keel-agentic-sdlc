@@ -70,15 +70,24 @@ Being precise about this, because the difference matters to anyone evaluating th
 | greenfield | all seven nodes, verification passed | yes, end to end |
 | ambiguous (park) | intake refusing to plan | yes |
 | ambiguous (resumed) | all seven nodes after the questions were answered | yes, end to end |
-| brownfield | impact analysis, design, human approval, implementation | partially |
+| brownfield | impact analysis, design, approval, implementation, test authoring | no, see below |
 
-The brownfield recording stops after implementation because my API credit ran
-out mid-run. What it does contain is the part unique to that scenario:
-reasoning over the existing service, the change-control approval firing before
-anything was written, and an implementation that genuinely modified the
-generated code (it added `app/apikeys.py` and changed `config.py`, `db.py`,
-`main.py`, `errors.py` and `ratelimit.py`). Test authoring onward is missing.
-Re-record it with `--mode live` and a funded key.
+**The brownfield recording is kept for what it caught, not as a passing run.**
+It contains the part unique to that scenario: reasoning over the existing
+service, the change-control approval firing before anything was written, and an
+implementation that genuinely modified the generated code (it added
+`app/apikeys.py` and changed `config.py`, `db.py`, `main.py`, `errors.py` and
+`ratelimit.py`).
+
+It also contains two failures, and they are the reason it is worth reading. Its
+verification node was rejected at the entry gate for an unguarded redirect that
+was not there, because the gate was scanning a truncated JSON summary of its
+upstream's output. The repair loop then fired twice trying to fix an
+implementation that had not caused it. Both are fixed, both are regression
+tested, and the audit log of the run that exposed them is this file. I ran out
+of API budget before I could re-record it against the fixed code, so the
+recording predates the fix and does not replay to completion. `keel run
+--scenario brownfield --mode live` re-records it in about twenty minutes.
 
 ## What each run leaves behind
 
