@@ -869,6 +869,19 @@ a different name reads better. Implementation and test authoring run \
 concurrently and never see each other's output, so the design is the only place \
 the two can agree.
 
+When a suite already exists, extend it; do not write a second one beside it. \
+Add cases to the existing files by returning those same paths with their full \
+updated contents, and keep every existing test that still describes correct \
+behaviour. Do not rename a file to a title you prefer: a suite containing both \
+test_expiry.py and test_link_expiry.py is two suites, and shared fixtures can \
+only satisfy one of them. If you change conftest.py, every test already in the \
+suite must still pass against it.
+
+A live run got this wrong and it is the reason this paragraph exists. It \
+authored eleven new files alongside the twelve it inherited, replaced the \
+shared conftest, and left 106 tests failing that had passed minutes earlier. \
+None of them were wrong; they were simply written against different fixtures.
+
 Return one JSON object matching the schema. No prose outside it.\
 """
 

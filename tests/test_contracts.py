@@ -205,3 +205,20 @@ def test_verify_does_not_retry_a_deterministic_check():
     assert plan.by_id(VERIFY).retry.max_attempts == 0
     # The generative stages keep their budget; only the deterministic one loses it.
     assert plan.by_id(IMPLEMENT).retry.max_attempts > 0
+
+
+def test_the_test_stage_is_told_to_extend_an_existing_suite():
+    """Regression: brownfield authored a parallel suite instead of extending one.
+
+    It wrote eleven new files alongside the twelve it inherited, under different
+    names, and replaced the shared conftest. 106 tests that had passed minutes
+    earlier failed, none of them wrong, all of them written against fixtures
+    that no longer existed. No amount of repairing the implementation can fix
+    being asked to satisfy two suites at once.
+    """
+    from keel.agents.definitions import DEFINITIONS
+    from keel.models import StageKind
+
+    prompt = DEFINITIONS[StageKind.TEST].system_prompt.lower()
+    assert "extend it" in prompt or "extend the" in prompt
+    assert "conftest" in prompt, "nothing warns against replacing shared fixtures"
