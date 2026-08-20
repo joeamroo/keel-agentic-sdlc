@@ -1,0 +1,18 @@
+# Never commit. Holds the live API key.
+.env
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.egg-info/
+
+# Interview prep, not part of the submission.
+INTERVIEW_PREP.md
+
+# Generated services keep their own bytecode caches; the source is committed
+# as evidence, the caches are not. Note this is deliberately not a bare
+# `workspace/`, which would have excluded runs/<id>/workspace/ entirely.
+runs/*/workspace/**/__pycache__/
+runs/*/workspace/**/.pytest_cache/
