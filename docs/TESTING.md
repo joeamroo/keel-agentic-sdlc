@@ -2,7 +2,7 @@
 
 ## What is tested, and why there
 
-There are 578 tests, but the split across layers matters more than the count.
+There are 602 tests, but the split across layers matters more than the count.
 
 | Layer | What it covers | Why it lives there |
 | --- | --- | --- |
@@ -10,6 +10,7 @@ There are 578 tests, but the split across layers matters more than the count.
 | Integration | The real `Executor` against a stub dispatcher. Gates, retries, fallback, rollback, approval, safe stop, parking, tier routing, concurrency. | The orchestration is the deliverable, so it is tested directly rather than inferred from a full pipeline run. |
 | Contract | The interface between the executor and the stage definitions. | A drifted template variable used to fail several minutes and several dollars into a live run. Now it fails in 80 milliseconds. |
 | Protocol | A2A in-process for speed, plus real HTTP against a live agent for card discovery, streaming, parking and cancellation. | In-process alone would test our wrapper rather than the protocol. |
+| CLI | Scenario seeding, replay refusal, summary writing. | The CLI is thin, but it is where the pieces meet, and a mistake there is invisible to every module-level test because each module is individually correct. |
 
 Tests that bind ports carry the `http` marker, so `pytest -m "not http"` gives a port-free run for constrained environments.
 

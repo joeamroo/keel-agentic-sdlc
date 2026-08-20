@@ -1,12 +1,14 @@
 # keel
 
-A governed agentic orchestrator for the software lifecycle. You give it a requirement in English; it plans the work as a dependency graph, runs the stages across a mesh of A2A agents, checks its own output at every step, stops to ask a human when the stakes justify it, and writes down everything it did and why.
+I built keel for a take-home assignment. You give it a requirement in English and it runs the software lifecycle end to end: it works out whether the requirement can even be planned, derives a dependency graph, runs the stages across a mesh of A2A agents with several in parallel, checks its own output at every step, stops and asks me before anything high-impact, rolls back what fails, and writes down everything it did and why.
 
-It builds a URL shortener. **The URL shortener is not the point.** It is the thing being built, chosen because it is small enough to generate honestly and interesting enough to have real security properties. The deliverable is the machinery that builds it.
+It builds a URL shortener. **The URL shortener is not the point.** It is the thing being built, and I picked it because it is small enough to generate honestly and interesting enough to have real security properties.
 
-## Why that distinction matters
+## Why I built the orchestrator and not just the shortener
 
-An agent that writes code is not hard to demonstrate. An agent you would let near a production repository is a different problem, and almost all of that problem is governance: knowing what to do next, refusing to proceed on a bad requirement, stopping before a change nobody approved, undoing a half-applied edit, and leaving a trail that survives an audit.
+The assignment is titled "Build an Agentic Software Engineering System, URL Shortener," and two things in it pushed me this way. Section 4.4 says to design and implement an agentic orchestration layer, and labels it the critical differentiator. Deliverable 3 asks for greenfield, brownfield and ambiguous scenarios, which one URL shortener cannot show; you show them by running the orchestrator three times on three kinds of input.
+
+What I actually wanted was an agent I would be willing to point at a repository and walk away from. Getting a model to write code is a prompt. Everything that stands between that and something I would trust unattended turned out to be governance: knowing what to do next, refusing bad input, stopping before something irreversible, undoing partial work, and leaving evidence.
 
 So the interesting surface here is the part between the requirement and the model:
 
@@ -21,10 +23,10 @@ requirement -> intake -> plan graph -> executor -> stage agents -> workspace
 
 ## Quickstart
 
-Requires Python 3.13 (the A2A SDK does). No API key needed.
+Needs Python 3.13, which the A2A SDK requires. No API key.
 
 ```bash
-uv venv --python 3.13 && uv pip install -e .
+uv venv --python 3.13 && uv pip install -e ".[dev]"
 .venv/bin/python -m keel.cli run --scenario greenfield
 ```
 
@@ -49,9 +51,9 @@ keel run --scenario ambiguous    # "make the links more secure"
 
 **Greenfield** exercises decomposition and parallelism. Implementation, test authoring and documentation all depend only on the design, so they run concurrently, and verification is a real synchronization barrier that actually executes pytest against the generated code. The exit code is recorded verbatim. Nothing claims a passing test suite it did not run.
 
-**Brownfield** exercises codebase reasoning and change control. It reads what greenfield produced, identifies the impacted modules and routes, and because it modifies a public API surface it stops for human approval before writing anything. If impact analysis contradicts the original plan, the planner emits a new plan version rather than mutating the old one, and the audit log shows both.
+**Brownfield** exercises codebase reasoning and change control. It reads what greenfield produced, identifies the impacted modules and routes, and because it modifies a public API surface it stops for my approval before writing anything. If impact analysis contradicts the original plan, the planner emits a new plan version rather than mutating the old one, and the audit log shows both.
 
-**Ambiguous** is the one worth watching. Given "make the links more secure," the analyst does not guess. It parks the task in the A2A `input_required` state, emits the questions it needs answered, and writes zero lines of code. Answer them and it resumes from the park instead of starting over:
+**Ambiguous** is the one I would watch. Given "make the links more secure," the analyst does not guess. It parks the task in the A2A `input_required` state, emits the questions it needs answered, and writes zero lines of code. Answer them and it resumes from the park instead of starting over:
 
 ```bash
 keel run --scenario ambiguous --answer-ambiguities
@@ -71,13 +73,13 @@ runs/<run_id>/
 
 ## Cost routing
 
-Nodes declare the thinking they need. Planning, code generation and review run on Claude Opus 5; documentation and release checks run on Haiku 4.5. The per-stage cost breakdown is in every run's metrics, so the routing decision can be checked against the bill.
+Nodes declare the thinking they need. Analysis, design, implementation, test authoring and review run on Claude Opus 5, because each of those is a decision that later stages encode. Documentation and release checks run on Claude Haiku 4.5, because by then the facts are settled. The per-stage cost breakdown is in every run's metrics, so the routing decision can be checked against the bill.
 
 ## A2A
 
-Each lifecycle stage is a real A2A agent serving an Agent Card at `/.well-known/agent-card.json` over JSON-RPC, with bearer auth between the orchestrator and the agents. The task states are the SDK's own enum, so `input_required` above is the protocol's state, not a local invention, and safe stop is a genuine `tasks/cancel` call.
+Each lifecycle stage is a real A2A agent serving an Agent Card at `/.well-known/agent-card.json` over JSON-RPC, with bearer auth between the orchestrator and the agents. The task states are the SDK's own enum, so `input_required` above is the protocol's state, not something I invented, and safe stop is a genuine `tasks/cancel` call.
 
-A2A is an interoperability protocol. It deliberately says nothing about governance, which means no dependency graph, gates, retry policy, rollback or re-planning. That gap is what this project is. See `docs/A2A_CONFORMANCE.md` for exactly what is protocol and what is ours, including what we do not implement.
+A2A is an interoperability protocol. It deliberately says nothing about governance, which means no dependency graph, gates, retry policy, rollback or re-planning. That gap is what this project is. See `docs/A2A_CONFORMANCE.md` for exactly what is protocol and what is mine, including what I did not implement.
 
 ## The assignment, answered
 
@@ -87,7 +89,7 @@ Every numbered requirement, what it means here, and where to look.
 
 `keel/intake.py` turns English into an `EngineeringProblem`: intent, testable acceptance criteria, constraints, an explicit ambiguity list and a confidence score. The interesting behaviour is the refusal. Below the confidence threshold, or with any unresolved blocking ambiguity, the run parks and writes nothing.
 
-Calibrating that was real work. The first version blocked on thirteen questions for a requirement a senior engineer could have started on, which is the mirror image of guessing and costs just as much. The prompt now separates a **documented assumption** (pick the defensible default, record it, proceed) from a **blocking question** (no defensible default, or wrong is expensive and irreversible).
+Calibrating that took real work. My first version blocked on thirteen questions for a requirement a senior engineer could have started on, which is the mirror image of guessing and costs just as much. The prompt now separates a **documented assumption** (pick the defensible default, record it, proceed) from a **blocking question** (no defensible default, or wrong is expensive and irreversible).
 
 ### 4.2 Task decomposition
 
@@ -99,7 +101,7 @@ The brownfield scenario reads the service greenfield produced, identifies impact
 
 ### 4.4 Workflow orchestration
 
-The critical differentiator, and the twelve requirements buried in that paragraph each have a home:
+The critical differentiator, and the twelve requirements in that paragraph each have a home:
 
 | Requirement | Where |
 | --- | --- |
@@ -124,11 +126,11 @@ Production-shaped FastAPI and SQLite source, an API design with justified trade-
 
 ### 4.6 Validation and risk control
 
-Gates at both ends of every node. Six policy rules covering secrets, open redirect, destructive operations, change control, test evidence and PII. Risks and trade-offs are in `ENGINEERING_SUMMARY.md`, including the known false positives, which were left flagging rather than silenced.
+Gates at both ends of every node. Six policy rules covering secrets, open redirect, destructive operations, change control, test evidence and PII. Risks and trade-offs are in `ENGINEERING_SUMMARY.md`, including the known false positives, which I left flagging rather than silenced.
 
 ### 4.7 Controlled autonomy
 
-Agents run multi-step work; humans hold the boundary. High-impact nodes need sign-off before they execute, the approval broker fails closed on silence, and an underspecified requirement stops the run rather than proceeding on a guess.
+Agents run multi-step work; a human holds the boundary. High-impact nodes need sign-off before they execute, the approval broker fails closed on silence, and an underspecified requirement stops the run rather than proceeding on a guess.
 
 ### 4.8 Final engineering summary
 
@@ -147,8 +149,9 @@ Agents run multi-step work; humans hold the boundary. High-impact nodes need sig
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q          # full suite
-.venv/bin/python -m pytest -m "not http"   # skip tests that bind ports
+.venv/bin/python -m pytest -q                # 602 tests
+.venv/bin/python -m pytest -q -m "not http"  # skip the ones that bind ports
+.venv/bin/ruff check keel/ tests/ --select F,B,E9
 ```
 
 ## Documentation
@@ -157,7 +160,7 @@ Agents run multi-step work; humans hold the boundary. High-impact nodes need sig
 | --- | --- |
 | `ARCHITECTURE.md` | components, control flow, and the decisions behind them |
 | `docs/architecture.drawio` | editable diagram, opens at app.diagrams.net |
-| `docs/A2A_CONFORMANCE.md` | what is protocol, what is ours, what is missing |
+| `docs/A2A_CONFORMANCE.md` | what is protocol, what is mine, what is missing |
 | `docs/TESTING.md` | test strategy, limitations, trade-offs |
 | `ENGINEERING_SUMMARY.md` | plan, rationale, risks, assumptions, limits |
 | `docs/scenarios/` | a walkthrough per scenario |

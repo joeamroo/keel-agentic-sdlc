@@ -19,7 +19,7 @@ Section 4.4 is one long paragraph containing twelve distinct requirements. I tre
 | Artifact | Where |
 | --- | --- |
 | Orchestrator | `keel/` |
-| Test suite | `tests/`, 578 tests |
+| Test suite | `tests/`, 602 tests |
 | Generated service | `runs/<run_id>/workspace/` |
 | Audit trail | `runs/<run_id>/audit.jsonl` |
 | Run report | `runs/<run_id>/report.html` |
@@ -41,13 +41,23 @@ Three things are worth calling out because they are where testing usually goes w
 
 ## Bugs found by running it
 
-Both were found by live runs, not by the suite, and both are now regression-tested.
+Most of these came from live runs rather than from the suite, which is the honest summary of where the risk actually sat. Every one is now regression-tested, and each fix was mutation-checked by breaking it deliberately to confirm a test catches it.
 
 **Rollback destroyed concurrent work.** Nodes in a topological level share one workspace. A failing node restored the whole snapshot, which deleted a sibling's already-committed output because that file did not exist when the snapshot was taken. In a live run this wiped a finished README. Rollback is now scoped to the paths the failing node itself wrote.
 
+**A policy rule punished good architecture.** The open-redirect rule evaluated each artifact in isolation. The generated service put its redirect in `app/main.py` and its SSRF guard in a dedicated `app/urls.py`, with a scheme allowlist, RFC1918 and link-local networks and the cloud metadata address named explicitly. The rule could not see across modules, so it denied correct code. Worse, because a denial is fed into the retry, it pressured the next attempt to inline the check purely to satisfy the gate. A gate that distorts the work is worse than no gate. The guard is now gathered across the whole change set, verified against the real 25-file service.
+
 **A policy rule blocked honest work.** The test-evidence rule fired on any node of kind TEST that produced no test transcript. The plan has two TEST nodes: one authors the suite, one runs it. The authoring node could never satisfy the rule, so it failed, rolled back and retried forever. The rule now keys on whether a node declares `tests_executed` among its exit rules, which is the contract it actually promised.
 
-A third, found by another agent: rewriting a generated module with same-length content within the same second let CPython reuse a stale `.pyc`, so **pytest reported a pass on code that fails**. That is precisely the orchestrator's retry loop, and it is the worst possible failure in a verification gate.
+**The verification gate could not run at all on a clean machine.** It invoked a bare `python`, which does not exist on macOS or most modern distributions. Exit 127 means the command never ran, so a gate treating any non-zero code as a test failure would have reported a red suite that was never executed. It now uses `sys.executable`.
+
+**Retry was not adaptive.** A live run showed the implement stage produce code the gate correctly rejected, then re-send the identical prompt. A retry that repeats the prompt gets the same answer, so the retry budget bought nothing. Gate violations now travel into the next attempt.
+
+**Brownfield seeded from the wrong run.** The helper accepted a scenario argument and ignored it, returning whichever run was newest. Running brownfield twice therefore seeded from the previous brownfield rather than from greenfield, stacking a change on the same change with no error.
+
+**Cost was silently understated.** The API echoes a dated model id (`claude-haiku-4-5-20251001`) that an alias-keyed pricing table misses, so every Haiku call was priced at zero.
+
+Two more came from other workstreams. Rewriting a generated module with same-length content within the same second let CPython reuse a stale `.pyc`, so **pytest reported a pass on code that fails**, which is precisely the shape of the retry loop and the worst possible failure in a verification gate. And the metrics table transposed rows with a bare `zip`, so a single short row would have dropped a column from the whole table.
 
 ## Trade-offs
 
