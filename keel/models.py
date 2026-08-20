@@ -93,14 +93,28 @@ class ModelTier(str, Enum):
     FAST = "fast"  # claude-haiku-4-5: classification, mechanical gate checks
 
 
+def _model_for(tier_env: str, default: str) -> str:
+    """Allow the tier's model to be overridden without touching the code.
+
+    Useful for a deliberate one-off, such as spending a larger budget on the
+    hardest run, without turning the routing decision into a code change that
+    then has to be reverted.
+    """
+    import os
+
+    return os.getenv(tier_env, default)
+
+
 MODEL_FOR_TIER: dict[ModelTier, str] = {
-    ModelTier.DEEP: "claude-opus-5",
-    ModelTier.FAST: "claude-haiku-4-5",
+    ModelTier.DEEP: _model_for("KEEL_DEEP_MODEL", "claude-opus-5"),
+    ModelTier.FAST: _model_for("KEEL_FAST_MODEL", "claude-haiku-4-5"),
 }
 
 # USD per million tokens, for the cost metric. Input, output.
 MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "claude-fable-5": (10.00, 50.00),
     "claude-opus-5": (5.00, 25.00),
+    "claude-sonnet-5": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),
 }
 

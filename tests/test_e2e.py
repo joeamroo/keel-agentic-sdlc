@@ -426,6 +426,91 @@ def test_the_default_policy_engine_accepts_a_realistically_modular_service(tmp_p
     assert decision.allowed, f"correct modular code was denied: {decision.reason}"
 
 
+def test_every_artifact_a_recorded_run_produced_still_passes_policy():
+    """The full corpus, including artifacts that never touch disk.
+
+    This is the check that matters, and the first version of it was theatre.
+    It scanned `runs/*/workspace`, which holds only the files a stage wrote.
+    Every policy false positive that actually cost money fired on a stage's
+    structured output instead: `design.json` and `analyze.json` live in memory
+    and in the audit log, never on the filesystem, so the guard could not see
+    the artifacts that were breaking runs.
+
+    Reconstructing them from the audit log makes a rule regression fail here,
+    in two seconds and for nothing, rather than live at Opus prices.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from keel.governance.policy import default_engine
+    from keel.models import Artifact, ImpactLevel, NodeSpec, StageKind
+
+    logs = sorted(Path("runs").glob("*/audit.jsonl"))
+    if not logs:
+        pytest.skip("no recorded runs committed yet")
+
+    engine = default_engine(approved_nodes={"implement", "refactor-seam"})
+    checked = 0
+
+    for log in logs:
+        artifacts: list[Artifact] = []
+        for line in log.read_text().splitlines():
+            try:
+                event = _json.loads(line)
+            except ValueError:
+                continue
+            if event.get("event_type") != "model_call":
+                continue
+            payload = event.get("payload") or {}
+            parsed = payload.get("parsed")
+            node_id = event.get("node_id") or "implement"
+            if not isinstance(parsed, dict):
+                continue
+
+            files = parsed.get("files")
+            if isinstance(files, list) and files:
+                for f in files:
+                    if isinstance(f, dict) and "path" in f:
+                        artifacts.append(
+                            Artifact(
+                                name=str(f["path"]),
+                                content=str(f.get("content", "")),
+                                produced_by=node_id,
+                                path=str(f["path"]),
+                            )
+                        )
+            else:
+                # The shape that broke real runs: a stage's structured output,
+                # rendered exactly as the dispatcher renders it.
+                artifacts.append(
+                    Artifact(
+                        name=f"{node_id}.json",
+                        content=_json.dumps(parsed, indent=2, sort_keys=True),
+                        produced_by=node_id,
+                        media_type="application/json",
+                    )
+                )
+
+        if not artifacts:
+            continue
+        checked += len(artifacts)
+
+        node = NodeSpec(
+            id="implement",
+            kind=StageKind.IMPLEMENT,
+            description="policy corpus",
+            impact=ImpactLevel.MEDIUM,
+            exit_rules=["files_written"],
+        )
+        blocking = [v for v in engine.evaluate(artifacts, node) if v.blocks]
+        assert not blocking, (
+            f"a rule change would now deny output that {log.parent.name} really produced: "
+            f"{[(v.rule_id, v.location) for v in blocking[:4]]}"
+        )
+
+    assert checked > 0, "the corpus was empty, so this test proved nothing"
+
+
 def test_committed_run_evidence_still_passes_policy():
     """Whatever is committed under runs/ must survive the current rule set.
 
