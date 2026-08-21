@@ -88,7 +88,17 @@ async def _run(args: argparse.Namespace) -> int:
                 f"scenario {scenario.key!r} needs the {scenario.seed_from!r} run first.\n"
                 f"run: keel run --scenario {scenario.seed_from}"
             )
-        shutil.copytree(seed, workspace.root, dirs_exist_ok=True)
+        # Source only. copytree bypasses Workspace, so the stale-bytecode
+        # protection in Workspace.write never applies to seeded files, and a
+        # copied .pyc carries the seed run's paths: a brownfield traceback then
+        # points at the greenfield workspace, which is confusing at exactly the
+        # moment you are trying to work out why a test failed.
+        shutil.copytree(
+            seed,
+            workspace.root,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+        )
         print(f"seeded workspace from {seed}")
 
     audit = AuditLog(run_id, RUNS)

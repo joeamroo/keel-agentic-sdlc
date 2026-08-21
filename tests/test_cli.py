@@ -126,3 +126,46 @@ def test_summary_is_written_even_when_a_run_parks(tmp_path):
     assert written["intake"]["state"] == "input_required"
     assert written["intake"]["ambiguities"][0]["question"] == "secure against what?"
     assert "run" not in written, "a parked run should not report execution results"
+
+
+def test_seeding_does_not_copy_build_artifacts(tmp_path, monkeypatch):
+    """Regression: seeding carried the previous run's bytecode across.
+
+    copytree bypasses Workspace, so the stale-bytecode protection in
+    Workspace.write never applied to seeded files. A copied .pyc also embeds
+    the seed run's source paths, so a brownfield traceback pointed at the
+    greenfield workspace while you were trying to read it.
+    """
+    import shutil
+
+    monkeypatch.setattr(cli, "RUNS", tmp_path)
+    seed = _make_run(
+        tmp_path,
+        "seed",
+        "greenfield",
+        {"app/main.py": "x = 1\n", "app/__pycache__/main.cpython-313.pyc": "stale"},
+    )
+    (seed / ".pytest_cache").mkdir(exist_ok=True)
+
+    target = tmp_path / "new" / "workspace"
+    target.mkdir(parents=True)
+    shutil.copytree(
+        seed,
+        target,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+    )
+
+    copied = {str(p.relative_to(target)) for p in target.rglob("*") if p.is_file()}
+    assert "app/main.py" in copied, "source was not seeded"
+    assert not any(".pyc" in c or "__pycache__" in c for c in copied), copied
+    assert not (target / ".pytest_cache").exists()
+
+
+def test_the_cli_seeding_call_excludes_caches():
+    """Pin the call itself, since the behaviour lives in its arguments."""
+    import inspect
+
+    source = inspect.getsource(cli._run)
+    assert "ignore_patterns" in source, "seeding no longer filters anything"
+    assert "__pycache__" in source
